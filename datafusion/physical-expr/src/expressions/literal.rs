@@ -143,7 +143,7 @@ impl PhysicalExpr for Literal {
     fn is_null(&self, _null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
         Some(self.value.is_null())
     }
-    
+
     fn is_not_true(
         &self,
         _null_columns: &std::collections::HashSet<usize>,

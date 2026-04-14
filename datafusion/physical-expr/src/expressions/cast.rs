@@ -304,7 +304,7 @@ impl PhysicalExpr for CastExpr {
 
         write!(f, ")")
     }
-    
+
     fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
         // CAST(NULL) = NULL
         self.expr.is_null(null_columns)
