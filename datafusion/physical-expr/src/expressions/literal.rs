@@ -139,6 +139,24 @@ impl PhysicalExpr for Literal {
     fn placement(&self) -> ExpressionPlacement {
         ExpressionPlacement::Literal
     }
+
+    fn is_null(&self, _null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+        Some(self.value.is_null())
+    }
+    
+    fn is_not_true(
+        &self,
+        _null_columns: &std::collections::HashSet<usize>,
+    ) -> Option<bool> {
+        if self.value.is_null() {
+            return Some(true); // NULL is not-true
+        }
+        // Boolean FALSE is not-true; TRUE is not not-true
+        if let ScalarValue::Boolean(Some(v)) = &self.value {
+            return Some(!v);
+        }
+        Some(false) // non-null non-boolean literal
+    }
 }
 
 /// Create a literal expression

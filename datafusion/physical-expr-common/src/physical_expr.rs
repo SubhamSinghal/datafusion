@@ -16,6 +16,7 @@
 // under the License.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt;
 use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
@@ -440,6 +441,32 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
     /// The default implementation returns [`ExpressionPlacement::KeepInPlace`].
     fn placement(&self) -> ExpressionPlacement {
         ExpressionPlacement::KeepInPlace
+    }
+
+    /// Returns whether this expression is guaranteed to evaluate to `NULL`
+    /// when all columns in `null_columns` are `NULL`.
+    ///
+    /// `null_columns` contains the column indices (in the input schema) that
+    /// are assumed to be `NULL`.
+    ///
+    /// - `Some(true)`:  definitely evaluates to `NULL`
+    /// - `Some(false)`: definitely does NOT evaluate to `NULL`
+    /// - `None`:        unknown (conservative default)
+    fn is_null(&self, _null_columns: &HashSet<usize>) -> Option<bool> {
+        None
+    }
+
+    /// Returns whether this expression is guaranteed to be not-true
+    /// (i.e., evaluates to `NULL` or `FALSE`).
+    ///
+    /// `null_columns` contains the column indices (in the input schema) that
+    /// are assumed to be `NULL`.
+    ///
+    /// - `Some(true)`:  definitely evaluates to `NULL` or `FALSE`
+    /// - `Some(false)`: definitely does NOT evaluate to `NULL` or `FALSE`
+    /// - `None`:        unknown (conservative default)
+    fn is_not_true(&self, _null_columns: &HashSet<usize>) -> Option<bool> {
+        None
     }
 }
 

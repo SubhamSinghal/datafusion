@@ -125,6 +125,19 @@ impl PhysicalExpr for TryCastExpr {
         self.expr.fmt_sql(f)?;
         write!(f, " AS {:?})", self.cast_type)
     }
+
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+        // TRY_CAST(NULL) = NULL
+        self.expr.is_null(null_columns)
+    }
+
+    fn is_not_true(
+        &self,
+        null_columns: &std::collections::HashSet<usize>,
+    ) -> Option<bool> {
+        // TRY_CAST(NULL) = NULL → not-true
+        self.expr.is_null(null_columns)
+    }
 }
 
 /// Return a PhysicalExpression representing `expr` casted to

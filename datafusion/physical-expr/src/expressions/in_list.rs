@@ -906,6 +906,19 @@ impl PhysicalExpr for InListExpr {
         }
         write!(f, ")")
     }
+
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+        // NULL IN (...) = NULL
+        self.expr.is_null(null_columns)
+    }
+
+    fn is_not_true(
+        &self,
+        null_columns: &std::collections::HashSet<usize>,
+    ) -> Option<bool> {
+        // NULL IN (...) = NULL → not-true
+        self.expr.is_null(null_columns)
+    }
 }
 
 impl PartialEq for InListExpr {

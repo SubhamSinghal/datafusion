@@ -609,6 +609,177 @@ impl PhysicalExpr for BinaryExpr {
         write!(f, " {} ", self.op)?;
         write_child(f, self.right.as_ref(), precedence)
     }
+
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+        match self.op {
+            // Comparisons and arithmetic: NULL if either child is NULL
+            Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::Plus
+            | Operator::Minus
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Modulo
+            | Operator::StringConcat
+            | Operator::LikeMatch
+            | Operator::ILikeMatch
+            | Operator::NotLikeMatch
+            | Operator::NotILikeMatch
+            | Operator::RegexMatch
+            | Operator::RegexIMatch
+            | Operator::RegexNotMatch
+            | Operator::RegexNotIMatch
+            | Operator::BitwiseAnd
+            | Operator::BitwiseOr
+            | Operator::BitwiseXor
+            | Operator::BitwiseShiftLeft
+            | Operator::BitwiseShiftRight
+            | Operator::AtArrow
+            | Operator::ArrowAt => {
+                match (
+                    self.left.is_null(null_columns),
+                    self.right.is_null(null_columns),
+                ) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                }
+            }
+            // IS DISTINCT FROM / IS NOT DISTINCT FROM never return NULL
+            Operator::IsDistinctFrom | Operator::IsNotDistinctFrom => Some(false),
+            // AND: NULL only when neither side is FALSE and at least one is NULL
+            //   FALSE AND NULL = FALSE (not null)
+            //   NULL AND TRUE = NULL
+            //   NULL AND NULL = NULL
+            Operator::And => {
+                let l_null = self.left.is_null(null_columns);
+                let r_null = self.right.is_null(null_columns);
+                let l_not_true = self.left.is_not_true(null_columns);
+                let r_not_true = self.right.is_not_true(null_columns);
+
+                // If either child is definitely FALSE → AND = FALSE (not null)
+                let l_false = l_not_true == Some(true) && l_null == Some(false);
+                let r_false = r_not_true == Some(true) && r_null == Some(false);
+                if l_false || r_false {
+                    return Some(false);
+                }
+
+                // If both children definitely not null → AND not null
+                if l_null == Some(false) && r_null == Some(false) {
+                    return Some(false);
+                }
+
+                // If both children definitely NULL → AND = NULL
+                if l_null == Some(true) && r_null == Some(true) {
+                    return Some(true);
+                }
+
+                None
+            }
+            // OR: NULL only when neither side is TRUE and at least one is NULL
+            //   TRUE OR NULL = TRUE (not null)
+            //   NULL OR FALSE = NULL
+            //   NULL OR NULL = NULL
+            Operator::Or => {
+                let l_null = self.left.is_null(null_columns);
+                let r_null = self.right.is_null(null_columns);
+                let l_not_true = self.left.is_not_true(null_columns);
+                let r_not_true = self.right.is_not_true(null_columns);
+
+                // If both children definitely not null → OR not null
+                if l_null == Some(false) && r_null == Some(false) {
+                    return Some(false);
+                }
+
+                // If both children definitely NULL → OR = NULL
+                if l_null == Some(true) && r_null == Some(true) {
+                    return Some(true);
+                }
+
+                // If one child is NULL and other is definitely FALSE → OR = NULL
+                let l_false = l_not_true == Some(true) && l_null == Some(false);
+                let r_false = r_not_true == Some(true) && r_null == Some(false);
+                if (l_null == Some(true) && r_false) || (r_null == Some(true) && l_false)
+                {
+                    return Some(true);
+                }
+
+                None
+            }
+            // All other operators: unknown
+            _ => None,
+        }
+    }
+
+    fn is_not_true(
+        &self,
+        null_columns: &std::collections::HashSet<usize>,
+    ) -> Option<bool> {
+        match self.op {
+            // AND: not-true if EITHER child is not-true
+            Operator::And => match (
+                self.left.is_not_true(null_columns),
+                self.right.is_not_true(null_columns),
+            ) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
+            // OR: not-true only if BOTH children are not-true
+            Operator::Or => match (
+                self.left.is_not_true(null_columns),
+                self.right.is_not_true(null_columns),
+            ) {
+                (Some(true), Some(true)) => Some(true),
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                _ => None,
+            },
+            // IS DISTINCT FROM: FALSE when both NULL, TRUE when one NULL other not
+            //   Never returns NULL.
+            Operator::IsDistinctFrom => {
+                let l_null = self.left.is_null(null_columns);
+                let r_null = self.right.is_null(null_columns);
+                match (l_null, r_null) {
+                    // Both NULL → FALSE → not-true
+                    (Some(true), Some(true)) => Some(true),
+                    // One NULL, other not → TRUE → passes
+                    (Some(true), Some(false)) | (Some(false), Some(true)) => Some(false),
+                    // Neither NULL → could be TRUE or FALSE
+                    (Some(false), Some(false)) => None,
+                    _ => None,
+                }
+            }
+            // IS NOT DISTINCT FROM: TRUE when both NULL, FALSE when one NULL other not
+            //   Never returns NULL.
+            Operator::IsNotDistinctFrom => {
+                let l_null = self.left.is_null(null_columns);
+                let r_null = self.right.is_null(null_columns);
+                match (l_null, r_null) {
+                    // Both NULL → TRUE → passes
+                    (Some(true), Some(true)) => Some(false),
+                    // One NULL, other not → FALSE → not-true
+                    (Some(true), Some(false)) | (Some(false), Some(true)) => Some(true),
+                    // Neither NULL → could be TRUE or FALSE
+                    (Some(false), Some(false)) => None,
+                    _ => None,
+                }
+            }
+            // All other operators (comparisons, arithmetic):
+            // NULL propagates through these operators.
+            _ => match (
+                self.left.is_null(null_columns),
+                self.right.is_null(null_columns),
+            ) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
+        }
+    }
 }
 
 /// Casts dictionary array to result type for binary numerical operators. Such operators

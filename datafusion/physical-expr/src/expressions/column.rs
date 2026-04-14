@@ -151,6 +151,17 @@ impl PhysicalExpr for Column {
     fn placement(&self) -> ExpressionPlacement {
         ExpressionPlacement::Column
     }
+
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+        Some(null_columns.contains(&self.index))
+    }
+
+    fn is_not_true(
+        &self,
+        null_columns: &std::collections::HashSet<usize>,
+    ) -> Option<bool> {
+        Some(null_columns.contains(&self.index))
+    }
 }
 
 impl Column {

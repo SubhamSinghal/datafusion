@@ -107,6 +107,19 @@ impl PhysicalExpr for IsNullExpr {
         self.arg.fmt_sql(f)?;
         write!(f, " IS NULL")
     }
+
+    fn is_null(&self, _null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+        // IS NULL never returns NULL — always TRUE or FALSE
+        Some(false)
+    }
+
+    fn is_not_true(
+        &self,
+        _null_columns: &std::collections::HashSet<usize>,
+    ) -> Option<bool> {
+        // IS NULL(NULL) = TRUE — passes the filter, not rejected
+        Some(false)
+    }
 }
 
 /// Create an IS NULL expression

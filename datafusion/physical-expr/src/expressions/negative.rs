@@ -178,6 +178,19 @@ impl PhysicalExpr for NegativeExpr {
         self.arg.fmt_sql(f)?;
         write!(f, ")")
     }
+
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+        // -NULL = NULL
+        self.arg.is_null(null_columns)
+    }
+
+    fn is_not_true(
+        &self,
+        null_columns: &std::collections::HashSet<usize>,
+    ) -> Option<bool> {
+        // -NULL = NULL → not-true
+        self.arg.is_null(null_columns)
+    }
 }
 
 /// Creates a unary expression NEGATIVE

@@ -149,6 +149,27 @@ impl PhysicalExpr for LikeExpr {
         write!(f, " {} ", self.op_name())?;
         self.pattern.fmt_sql(f)
     }
+
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+        // NULL LIKE pattern = NULL, expr LIKE NULL = NULL
+        match (
+            self.expr.is_null(null_columns),
+            self.pattern.is_null(null_columns),
+        ) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        }
+    }
+
+    fn is_not_true(
+        &self,
+        null_columns: &std::collections::HashSet<usize>,
+    ) -> Option<bool> {
+        // NULL LIKE pattern = NULL → not-true
+        // expr LIKE NULL = NULL → not-true
+        self.is_null(null_columns)
+    }
 }
 
 /// used for optimize Dictionary like

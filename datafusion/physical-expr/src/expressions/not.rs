@@ -184,6 +184,21 @@ impl PhysicalExpr for NotExpr {
         write!(f, "NOT ")?;
         self.arg.fmt_sql(f)
     }
+
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+        // NOT(NULL) = NULL
+        self.arg.is_null(null_columns)
+    }
+
+    fn is_not_true(
+        &self,
+        null_columns: &std::collections::HashSet<usize>,
+    ) -> Option<bool> {
+        // NOT(NULL) = NULL (not-true) ✓
+        // NOT(FALSE) = TRUE (passes!) ✗
+        // Must use is_null — NOT flips FALSE to TRUE
+        self.arg.is_null(null_columns)
+    }
 }
 
 /// Creates a unary expression NOT

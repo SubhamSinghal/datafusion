@@ -1363,6 +1363,40 @@ impl PhysicalExpr for CaseExpr {
         }
         write!(f, "END")
     }
+
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+        // CASE is NULL if ALL result branches (THEN values + ELSE) are NULL.
+        // If there's no ELSE, the implicit ELSE is NULL.
+        for (_when, then) in &self.body.when_then_expr {
+            match then.is_null(null_columns) {
+                Some(true) => {}
+                Some(false) => return Some(false),
+                None => return None,
+            }
+        }
+        match &self.body.else_expr {
+            Some(else_expr) => else_expr.is_null(null_columns),
+            None => Some(true), // implicit ELSE NULL
+        }
+    }
+
+    fn is_not_true(
+        &self,
+        null_columns: &std::collections::HashSet<usize>,
+    ) -> Option<bool> {
+        // CASE is not-true if ALL result branches (THEN values + ELSE) are not-true.
+        for (_when, then) in &self.body.when_then_expr {
+            match then.is_not_true(null_columns) {
+                Some(true) => {}
+                Some(false) => return Some(false),
+                None => return None,
+            }
+        }
+        match &self.body.else_expr {
+            Some(else_expr) => else_expr.is_not_true(null_columns),
+            None => Some(true), // implicit ELSE NULL is not-true
+        }
+    }
 }
 
 /// Attempts to const evaluate the given `predicate`.
