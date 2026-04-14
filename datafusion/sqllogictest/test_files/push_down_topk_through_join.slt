@@ -1,0 +1,176 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Tests for pushing TopK (Sort with fetch) through outer joins
+
+statement ok
+set datafusion.execution.target_partitions = 1;
+
+statement ok
+set datafusion.explain.logical_plan_only = true;
+
+# Create test tables
+statement ok
+CREATE TABLE t1 (a INT, b INT, c VARCHAR) AS VALUES
+  (1, 10, 'one'),
+  (2, 20, 'two'),
+  (3, 30, 'three'),
+  (4, 40, 'four'),
+  (5, 50, 'five');
+
+statement ok
+CREATE TABLE t2 (x INT, y INT, z VARCHAR) AS VALUES
+  (1, 100, 'alpha'),
+  (2, 200, 'beta'),
+  (3, 300, 'gamma'),
+  (6, 600, 'delta'),
+  (7, 700, 'epsilon');
+
+###
+### Positive cases — TopK should be pushed down
+###
+
+# LEFT JOIN: TopK on left-side columns pushed to left child
+query TT
+EXPLAIN SELECT t1.a, t1.b, t2.x
+FROM t1 LEFT JOIN t2 ON t1.a = t2.x
+ORDER BY t1.b ASC LIMIT 3;
+----
+logical_plan
+01)Sort: t1.b ASC NULLS LAST, fetch=3
+02)--Left Join: t1.a = t2.x
+03)----Sort: t1.b ASC NULLS LAST, fetch=3
+04)------TableScan: t1 projection=[a, b]
+05)----TableScan: t2 projection=[x]
+
+# Verify correctness of the above query
+query III
+SELECT t1.a, t1.b, t2.x
+FROM t1 LEFT JOIN t2 ON t1.a = t2.x
+ORDER BY t1.b ASC LIMIT 3;
+----
+1 10 1
+2 20 2
+3 30 3
+
+# RIGHT JOIN: TopK on right-side columns pushed to right child
+query TT
+EXPLAIN SELECT t1.a, t2.x, t2.y
+FROM t1 RIGHT JOIN t2 ON t1.a = t2.x
+ORDER BY t2.y ASC LIMIT 3;
+----
+logical_plan
+01)Sort: t2.y ASC NULLS LAST, fetch=3
+02)--Right Join: t1.a = t2.x
+03)----TableScan: t1 projection=[a]
+04)----Sort: t2.y ASC NULLS LAST, fetch=3
+05)------TableScan: t2 projection=[x, y]
+
+# Verify correctness
+query III
+SELECT t1.a, t2.x, t2.y
+FROM t1 RIGHT JOIN t2 ON t1.a = t2.x
+ORDER BY t2.y ASC LIMIT 3;
+----
+1 1 100
+2 2 200
+3 3 300
+
+###
+### Negative cases — TopK should NOT be pushed down
+###
+
+# INNER JOIN: no pushdown
+query TT
+EXPLAIN SELECT t1.a, t2.x
+FROM t1 INNER JOIN t2 ON t1.a = t2.x
+ORDER BY t1.b ASC LIMIT 3;
+----
+logical_plan
+01)Projection: t1.a, t2.x
+02)--Sort: t1.b ASC NULLS LAST, fetch=3
+03)----Projection: t1.a, t2.x, t1.b
+04)------Inner Join: t1.a = t2.x
+05)--------TableScan: t1 projection=[a, b]
+06)--------TableScan: t2 projection=[x]
+
+# LEFT JOIN but sort on right-side columns: no pushdown
+query TT
+EXPLAIN SELECT t1.a, t2.x, t2.y
+FROM t1 LEFT JOIN t2 ON t1.a = t2.x
+ORDER BY t2.y ASC LIMIT 3;
+----
+logical_plan
+01)Sort: t2.y ASC NULLS LAST, fetch=3
+02)--Left Join: t1.a = t2.x
+03)----TableScan: t1 projection=[a]
+04)----TableScan: t2 projection=[x, y]
+
+# FULL OUTER JOIN: no pushdown
+query TT
+EXPLAIN SELECT t1.a, t2.x
+FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.x
+ORDER BY t1.b ASC LIMIT 3;
+----
+logical_plan
+01)Projection: t1.a, t2.x
+02)--Sort: t1.b ASC NULLS LAST, fetch=3
+03)----Projection: t1.a, t2.x, t1.b
+04)------Full Join: t1.a = t2.x
+05)--------TableScan: t1 projection=[a, b]
+06)--------TableScan: t2 projection=[x]
+
+# LEFT JOIN with non-equijoin filter: no pushdown (conservative)
+query TT
+EXPLAIN SELECT t1.a, t1.b, t2.x
+FROM t1 LEFT JOIN t2 ON t1.a = t2.x AND t1.b > t2.y
+ORDER BY t1.b ASC LIMIT 3;
+----
+logical_plan
+01)Sort: t1.b ASC NULLS LAST, fetch=3
+02)--Projection: t1.a, t1.b, t2.x
+03)----Left Join: t1.a = t2.x Filter: t1.b > t2.y
+04)------TableScan: t1 projection=[a, b]
+05)------TableScan: t2 projection=[x, y]
+
+# Sort without LIMIT: no pushdown
+query TT
+EXPLAIN SELECT t1.a, t1.b, t2.x
+FROM t1 LEFT JOIN t2 ON t1.a = t2.x
+ORDER BY t1.b ASC;
+----
+logical_plan
+01)Sort: t1.b ASC NULLS LAST
+02)--Left Join: t1.a = t2.x
+03)----TableScan: t1 projection=[a, b]
+04)----TableScan: t2 projection=[x]
+
+###
+### Config reset
+###
+
+statement ok
+set datafusion.execution.target_partitions = 4;
+
+statement ok
+reset datafusion.explain.logical_plan_only;
+
+statement ok
+DROP TABLE t1;
+
+statement ok
+DROP TABLE t2;
