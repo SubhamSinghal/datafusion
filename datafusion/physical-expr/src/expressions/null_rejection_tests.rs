@@ -505,7 +505,6 @@ mod tests {
 
     #[test]
     fn case_when_condition_is_null() -> Result<()> {
-        let s = schema();
         // CASE WHEN NULL THEN 42 ELSE 0 END
         // WHEN condition is NULL → this branch is never taken, but
         // we don't evaluate WHEN conditions — we only check THEN/ELSE values.
@@ -522,7 +521,6 @@ mod tests {
 
     #[test]
     fn case_when_null_then_null_else_null() -> Result<()> {
-        let s = schema();
         // CASE WHEN NULL THEN NULL ELSE NULL END
         // All result values are NULL regardless of WHEN condition
         let case_expr = crate::expressions::CaseExpr::try_new(

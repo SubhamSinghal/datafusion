@@ -246,8 +246,8 @@ mod tests {
 
     #[test]
     fn eliminate_left_with_not_null() -> Result<()> {
-        let t1 = test_table_scan_with_name_and_utf8("t1")?;
-        let t2 = test_table_scan_with_name_and_utf8("t2")?;
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
 
         // eliminate to inner join
         let plan = LogicalPlanBuilder::from(t1)
@@ -270,8 +270,8 @@ mod tests {
 
     #[test]
     fn eliminate_right_with_or() -> Result<()> {
-        let t1 = test_table_scan_with_name_and_utf8("t1")?;
-        let t2 = test_table_scan_with_name_and_utf8("t2")?;
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
 
         // eliminate to inner join
         let plan = LogicalPlanBuilder::from(t1)
@@ -298,8 +298,8 @@ mod tests {
 
     #[test]
     fn eliminate_full_with_and() -> Result<()> {
-        let t1 = test_table_scan_with_name_and_utf8("t1")?;
-        let t2 = test_table_scan_with_name_and_utf8("t2")?;
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
 
         // eliminate to inner join
         let plan = LogicalPlanBuilder::from(t1)
@@ -541,8 +541,8 @@ mod tests {
 
     #[test]
     fn eliminate_left_with_like() -> Result<()> {
-        let t1 = test_table_scan_with_name("t1")?;
-        let t2 = test_table_scan_with_name("t2")?;
+        let t1 = test_table_scan_with_name_and_utf8("t1")?;
+        let t2 = test_table_scan_with_name_and_utf8("t2")?;
 
         // LIKE rejects nulls: if t2.b is NULL, the result is NULL (filtered out)
         let plan = LogicalPlanBuilder::from(t1)
@@ -565,8 +565,8 @@ mod tests {
 
     #[test]
     fn eliminate_left_with_like_pattern_column() -> Result<()> {
-        let t1 = test_table_scan_with_name("t1")?;
-        let t2 = test_table_scan_with_name("t2")?;
+        let t1 = test_table_scan_with_name_and_utf8("t1")?;
+        let t2 = test_table_scan_with_name_and_utf8("t2")?;
 
         // LIKE with nullable column on the pattern side:
         // 'x' LIKE t2.b → if t2.b is NULL, result is NULL (filtered out)
@@ -590,8 +590,8 @@ mod tests {
 
     #[test]
     fn eliminate_full_with_like_cross_side() -> Result<()> {
-        let t1 = test_table_scan_with_name("t1")?;
-        let t2 = test_table_scan_with_name("t2")?;
+        let t1 = test_table_scan_with_name_and_utf8("t1")?;
+        let t2 = test_table_scan_with_name_and_utf8("t2")?;
 
         // LIKE with columns from both sides: t1.c LIKE t2.b
         // If t1 is NULL → NULL LIKE t2.b → NULL → filtered out (left non-nullable)
