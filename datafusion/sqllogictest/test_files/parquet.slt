@@ -909,3 +909,228 @@ RESET datafusion.catalog.create_default_catalog_and_schema;
 
 statement ok
 DROP TABLE t;
+
+###
+### Test arithmetic expression pruning in PruningPredicate
+###
+
+statement ok
+set datafusion.explain.physical_plan_only = true;
+
+# Create parquet file with integer data spanning a known range
+statement ok
+COPY (VALUES (1), (5), (10), (50), (100))
+TO 'test_files/scratch/parquet/arith_prune.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE arith_prune
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet/arith_prune.parquet';
+
+# col + literal > literal: should generate pruning predicate with arithmetic
+query TT
+EXPLAIN SELECT * FROM arith_prune WHERE column1 + 5 > 10;
+----
+physical_plan
+01)FilterExec: column1@0 + 5 > 10
+02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet/arith_prune.parquet]]}, projection=[column1], file_type=parquet, predicate=column1@0 + 5 > 10, pruning_predicate=column1_null_count@1 != row_count@2 AND column1_max@0 + 5 > 10, required_guarantees=[]
+
+# Verify correctness: column1 + 5 > 10 means column1 > 5
+query I rowsort
+SELECT * FROM arith_prune WHERE column1 + 5 > 10;
+----
+10
+100
+50
+
+# col - literal < literal: subtraction pruning
+query TT
+EXPLAIN SELECT * FROM arith_prune WHERE column1 - 3 < 5;
+----
+physical_plan
+01)FilterExec: column1@0 - 3 < 5
+02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet/arith_prune.parquet]]}, projection=[column1], file_type=parquet, predicate=column1@0 - 3 < 5, pruning_predicate=column1_null_count@1 != row_count@2 AND column1_min@0 - 3 < 5, required_guarantees=[]
+
+# Verify correctness: column1 - 3 < 5 means column1 < 8
+query I rowsort
+SELECT * FROM arith_prune WHERE column1 - 3 < 5;
+----
+1
+5
+
+# Test with date + interval pruning
+statement ok
+COPY (
+    SELECT column1::DATE as d FROM (
+        VALUES ('2024-01-15'), ('2024-03-20'), ('2024-06-01'), ('2024-09-15'), ('2024-12-01')
+    )
+)
+TO 'test_files/scratch/parquet/date_arith_prune.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE date_arith_prune
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet/date_arith_prune.parquet';
+
+# date + interval > date: should generate pruning predicate
+query TT
+EXPLAIN SELECT * FROM date_arith_prune WHERE d + INTERVAL '30 days' > DATE '2024-07-01';
+----
+physical_plan
+01)FilterExec: d@0 + IntervalMonthDayNano { months: 0, days: 30, nanoseconds: 0 } > 2024-07-01
+02)--RepartitionExec: partitioning=RoundRobinBatch(2), input_partitions=1
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet/date_arith_prune.parquet]]}, projection=[d], file_type=parquet, predicate=d@0 + IntervalMonthDayNano { months: 0, days: 30, nanoseconds: 0 } > 2024-07-01, pruning_predicate=d_null_count@1 != row_count@2 AND d_max@0 + IntervalMonthDayNano { months: 0, days: 30, nanoseconds: 0 } > 2024-07-01, required_guarantees=[]
+
+# Verify correctness: d + 30 days > 2024-07-01 means d > 2024-06-01
+query D rowsort
+SELECT * FROM date_arith_prune WHERE d + INTERVAL '30 days' > DATE '2024-07-01';
+----
+2024-09-15
+2024-12-01
+
+statement ok
+DROP TABLE date_arith_prune;
+
+# col + literal <= literal: lteq operator
+query I rowsort
+SELECT * FROM arith_prune WHERE column1 + 5 <= 10;
+----
+1
+5
+
+# col + literal = literal: equality operator
+query I rowsort
+SELECT * FROM arith_prune WHERE column1 + 5 = 55;
+----
+50
+
+# Test with float column
+statement ok
+COPY (
+    SELECT column1::DOUBLE as f FROM (
+        VALUES (1.5), (5.0), (10.5), (50.0), (100.5)
+    )
+)
+TO 'test_files/scratch/parquet/float_arith_prune.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE float_arith_prune
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet/float_arith_prune.parquet';
+
+# float col + literal > literal
+query R rowsort
+SELECT * FROM float_arith_prune WHERE f + 0.5 > 11.0;
+----
+100.5
+50
+
+statement ok
+DROP TABLE float_arith_prune;
+
+# Test cast(col) + literal
+query I rowsort
+SELECT * FROM arith_prune WHERE CAST(column1 AS BIGINT) + 5 > 10;
+----
+10
+100
+50
+
+# date - interval < date
+statement ok
+COPY (
+    SELECT column1::DATE as d FROM (
+        VALUES ('2024-01-15'), ('2024-03-20'), ('2024-06-01'), ('2024-09-15'), ('2024-12-01')
+    )
+)
+TO 'test_files/scratch/parquet/date_minus_prune.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE date_minus_prune
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet/date_minus_prune.parquet';
+
+# date - interval < date
+query D rowsort
+SELECT * FROM date_minus_prune WHERE d - INTERVAL '30 days' < DATE '2024-01-01';
+----
+2024-01-15
+
+statement ok
+DROP TABLE date_minus_prune;
+
+# Test timestamp + interval
+statement ok
+COPY (
+    SELECT column1::TIMESTAMP as ts FROM (
+        VALUES
+            ('2024-01-15T10:30:45'),
+            ('2024-03-20T15:00:00'),
+            ('2024-06-01T08:15:30'),
+            ('2024-09-15T22:45:00'),
+            ('2024-12-01T03:30:00')
+    )
+)
+TO 'test_files/scratch/parquet/ts_arith_prune.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE ts_arith_prune
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet/ts_arith_prune.parquet';
+
+# timestamp + interval > timestamp
+query P rowsort
+SELECT * FROM ts_arith_prune WHERE ts + INTERVAL '60 days' > TIMESTAMP '2024-08-01 00:00:00';
+----
+2024-09-15T22:45:00
+2024-12-01T03:30:00
+
+# timestamp - interval < timestamp (midnight overflow)
+query P rowsort
+SELECT * FROM ts_arith_prune WHERE ts - INTERVAL '12 hours' < TIMESTAMP '2024-01-15 00:00:00';
+----
+2024-01-15T10:30:45
+
+statement ok
+DROP TABLE ts_arith_prune;
+
+# Test cast(timestamp as date) + interval
+statement ok
+COPY (
+    SELECT column1::TIMESTAMP as ts FROM (
+        VALUES
+            ('2024-01-31T23:59:00'),
+            ('2024-06-15T12:00:00'),
+            ('2024-09-01T06:30:00')
+    )
+)
+TO 'test_files/scratch/parquet/cast_ts_date_prune.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE cast_ts_date_prune
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet/cast_ts_date_prune.parquet';
+
+# cast(ts as date) + interval > date: truncates time, then adds days
+query P rowsort
+SELECT * FROM cast_ts_date_prune WHERE CAST(ts AS DATE) + INTERVAL '30 days' > DATE '2024-07-01';
+----
+2024-06-15T12:00:00
+2024-09-01T06:30:00
+
+statement ok
+DROP TABLE cast_ts_date_prune;
+
+statement ok
+DROP TABLE arith_prune;
+
+statement ok
+reset datafusion.explain.physical_plan_only;
