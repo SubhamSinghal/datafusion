@@ -1057,7 +1057,7 @@ mod tests {
             .build()?;
 
         assert_optimized_plan_equal!(plan, @r#"
-        Filter: t1.b LIKE Utf8("%pattern%") AND t2.b BETWEEN Utf8("a") AND Utf8(10)
+        Filter: t1.b LIKE Utf8("%pattern%") AND t2.b BETWEEN Utf8("a") AND Utf8("z")
           Inner Join: t1.a = t2.a
             TableScan: t1
             TableScan: t2
