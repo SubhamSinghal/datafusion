@@ -466,7 +466,7 @@ macro_rules! int_tests {
                 Scenario::Int,
                 &format!("SELECT * FROM t where i{}+1 = 1", $bits),
                 Some(0),
-                Some(0),
+                Some(10),
                 2,
                 5,
             )
@@ -646,7 +646,7 @@ macro_rules! uint_tests {
                 Scenario::UInt,
                 &format!("SELECT * FROM t where u{}+1 = 6", $bits),
                 Some(0),
-                Some(0),
+                Some(10),
                 2,
                 5,
             )
@@ -786,12 +786,12 @@ async fn prune_f64_scalar_fun() {
 
 #[tokio::test]
 async fn prune_f64_complex_expr() {
-    // result of sql "SELECT * FROM t where f+1 > 1.1"" is not supported
+    // result of sql "SELECT * FROM t where f+1 > 1.1"" is supported for pruning
     test_prune(
         Scenario::Float64,
         "SELECT * FROM t where f+1 > 1.1",
         Some(0),
-        Some(0),
+        Some(10),
         9,
         5,
     )
