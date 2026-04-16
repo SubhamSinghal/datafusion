@@ -6018,7 +6018,7 @@ mod tests {
         prune_with_expr(
             (cast(col("d"), DataType::Timestamp(TimeUnit::Nanosecond, None))
                 + lit(ScalarValue::new_interval_dt(0, 6 * 3600 * 1000)))
-                    .gt(lit(ScalarValue::TimestampNanosecond(Some(threshold), None))),
+            .gt(lit(ScalarValue::TimestampNanosecond(Some(threshold), None))),
             &schema,
             &statistics,
             expected_ret,
