@@ -1167,7 +1167,7 @@ fn rewrite_expr_to_prunable(
         } else {
             plan_err!("Not with complex expression {column_expr:?} is not supported")
         }
-    } else if let Some(bin) = column_expr_any.downcast_ref::<phys_expr::BinaryExpr>() {
+    } else if let Some(bin) = column_expr.downcast_ref::<phys_expr::BinaryExpr>() {
         // Arithmetic expressions with a column and a constant.
         // col + C, col - C are monotonically increasing → pass through.
         // The existing stat_column_expr machinery will substitute col → col_min/col_max
