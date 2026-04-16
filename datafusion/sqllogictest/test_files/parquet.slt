@@ -917,6 +917,9 @@ DROP TABLE t;
 statement ok
 set datafusion.explain.physical_plan_only = true;
 
+statement ok
+set datafusion.execution.target_partitions = 2;
+
 # Create parquet file with integer data spanning a known range
 statement ok
 COPY (VALUES (1), (5), (10), (50), (100))
@@ -1134,3 +1137,6 @@ DROP TABLE arith_prune;
 
 statement ok
 reset datafusion.explain.physical_plan_only;
+
+statement ok
+reset datafusion.execution.target_partitions;
