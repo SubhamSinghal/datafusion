@@ -1138,7 +1138,7 @@ DROP TABLE arith_prune;
 statement ok
 reset datafusion.explain.physical_plan_only;
 
-statement ok
 # The SLT runner sets target_partitions to 4 instead of using the system default,
 # so restore it explicitly rather than using reset (which would apply the system default).
+statement ok
 set datafusion.execution.target_partitions = 4;
