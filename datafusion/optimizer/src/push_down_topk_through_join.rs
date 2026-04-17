@@ -114,11 +114,14 @@ impl OptimizerRule for PushDownTopKThroughJoin {
             _ => return Ok(Transformed::no(plan)),
         };
 
-        // Only outer/semi/anti joins where the preserved side is known.
+        // Only outer joins where the preserved side is known.
+        // Semi/Anti joins are excluded: not all preserved-side rows appear in
+        // the output (only matched/unmatched rows do), so pushing fetch=N to
+        // the preserved child can drop rows that would have survived the filter.
         // No non-equijoin filter (conservative — filter may change row count).
         let preserved_is_left = match join.join_type {
-            JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => true,
-            JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => false,
+            JoinType::Left => true,
+            JoinType::Right => false,
             _ => return Ok(Transformed::no(plan)),
         };
         if join.filter.is_some() {
@@ -513,9 +516,9 @@ mod test {
         )
     }
 
-    /// LEFT SEMI JOIN: TopK on left-side columns → pushed to left child.
+    /// LEFT SEMI JOIN: pushing fetch is unsafe (not all left rows appear in output).
     #[test]
-    fn topk_pushed_for_left_semi_join() -> Result<()> {
+    fn topk_not_pushed_for_left_semi_join() -> Result<()> {
         let t1 = test_table_scan_with_name("t1")?;
         let t2 = test_table_scan_with_name("t2")?;
 
@@ -534,16 +537,15 @@ mod test {
             @r"
         Sort: t1.b ASC NULLS LAST, fetch=3
           LeftSemi Join: t1.a = t2.a
-            Sort: t1.b ASC NULLS LAST, fetch=3
-              TableScan: t1
+            TableScan: t1
             TableScan: t2
         "
         )
     }
 
-    /// LEFT ANTI JOIN: TopK on left-side columns → pushed to left child.
+    /// LEFT ANTI JOIN: pushing fetch is unsafe (not all left rows appear in output).
     #[test]
-    fn topk_pushed_for_left_anti_join() -> Result<()> {
+    fn topk_not_pushed_for_left_anti_join() -> Result<()> {
         let t1 = test_table_scan_with_name("t1")?;
         let t2 = test_table_scan_with_name("t2")?;
 
@@ -562,16 +564,15 @@ mod test {
             @r"
         Sort: t1.b ASC NULLS LAST, fetch=3
           LeftAnti Join: t1.a = t2.a
-            Sort: t1.b ASC NULLS LAST, fetch=3
-              TableScan: t1
+            TableScan: t1
             TableScan: t2
         "
         )
     }
 
-    /// RIGHT SEMI JOIN: TopK on right-side columns → pushed to right child.
+    /// RIGHT SEMI JOIN: pushing fetch is unsafe (not all right rows appear in output).
     #[test]
-    fn topk_pushed_for_right_semi_join() -> Result<()> {
+    fn topk_not_pushed_for_right_semi_join() -> Result<()> {
         let t1 = test_table_scan_with_name("t1")?;
         let t2 = test_table_scan_with_name("t2")?;
 
@@ -591,15 +592,14 @@ mod test {
         Sort: t2.b ASC NULLS LAST, fetch=3
           RightSemi Join: t1.a = t2.a
             TableScan: t1
-            Sort: t2.b ASC NULLS LAST, fetch=3
-              TableScan: t2
+            TableScan: t2
         "
         )
     }
 
-    /// RIGHT ANTI JOIN: TopK on right-side columns → pushed to right child.
+    /// RIGHT ANTI JOIN: pushing fetch is unsafe (not all right rows appear in output).
     #[test]
-    fn topk_pushed_for_right_anti_join() -> Result<()> {
+    fn topk_not_pushed_for_right_anti_join() -> Result<()> {
         let t1 = test_table_scan_with_name("t1")?;
         let t2 = test_table_scan_with_name("t2")?;
 
@@ -619,8 +619,7 @@ mod test {
         Sort: t2.b ASC NULLS LAST, fetch=3
           RightAnti Join: t1.a = t2.a
             TableScan: t1
-            Sort: t2.b ASC NULLS LAST, fetch=3
-              TableScan: t2
+            TableScan: t2
         "
         )
     }
