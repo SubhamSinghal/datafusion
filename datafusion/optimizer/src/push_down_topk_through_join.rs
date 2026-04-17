@@ -57,9 +57,12 @@ use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
 use crate::utils::{has_all_column_refs, schema_columns};
-use datafusion_common::Result;
-use datafusion_common::tree_node::Transformed;
-use datafusion_expr::logical_plan::{JoinType, LogicalPlan, Sort as SortPlan};
+use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::{Column, Result};
+use datafusion_expr::logical_plan::{
+    JoinType, LogicalPlan, Projection, Sort as SortPlan,
+};
+use datafusion_expr::{Expr, SortExpr};
 
 /// Optimization rule that pushes TopK (Sort with fetch) through
 /// LEFT / RIGHT outer joins when all sort expressions come from
@@ -104,17 +107,29 @@ impl OptimizerRule for PushDownTopKThroughJoin {
             _ => return Ok(Transformed::no(plan)),
         };
 
-        // Only LEFT or RIGHT, no non-equijoin filter
+        // Only outer/semi/anti joins where the preserved side is known.
+        // No non-equijoin filter (conservative — filter may change row count).
         let preserved_is_left = match join.join_type {
-            JoinType::Left => true,
-            JoinType::Right => false,
+            JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti => true,
+            JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => false,
             _ => return Ok(Transformed::no(plan)),
         };
         if join.filter.is_some() {
             return Ok(Transformed::no(plan));
         }
 
-        // Check all sort expression columns come from the preserved side
+        // Check all sort expression columns come from the preserved side.
+        // When there's a projection, resolve sort expressions through it first
+        // since the sort references post-projection columns.
+        let resolved_sort_exprs = if has_projection {
+            let LogicalPlan::Projection(proj) = sort.input.as_ref() else {
+                unreachable!()
+            };
+            resolve_sort_exprs_through_projection(&sort.expr, proj)?
+        } else {
+            sort.expr.clone()
+        };
+
         let preserved_schema = if preserved_is_left {
             join.left.schema()
         } else {
@@ -122,28 +137,65 @@ impl OptimizerRule for PushDownTopKThroughJoin {
         };
         let preserved_cols = schema_columns(preserved_schema);
 
-        let all_from_preserved = sort
-            .expr
+        let all_from_preserved = resolved_sort_exprs
             .iter()
             .all(|sort_expr| has_all_column_refs(&sort_expr.expr, &preserved_cols));
         if !all_from_preserved {
             return Ok(Transformed::no(plan));
         }
 
-        // Don't push if preserved child is already a Sort (redundant)
+        // Push through when the preserved child has no Sort, or has a Sort
+        // with a larger/no fetch limit (our tighter limit reduces data further).
+        //
+        // Example (push): Sort(a ASC, fetch=5) → Join → Sort(a ASC, fetch=10)
+        //   Child limits to 10, our tighter fetch=5 reduces data further.
+        //
+        // Example (push): Sort(a ASC, fetch=5) → Join → Sort(a ASC)
+        //   Child has no fetch (full sort), adding fetch=5 limits early.
+        //
+        // Example (skip): Sort(a ASC, fetch=5) → Join → Sort(a ASC, fetch=3)
+        //   Child already limits to 3 rows, pushing fetch=5 won't help.
         let preserved_child = if preserved_is_left {
             &join.left
         } else {
             &join.right
         };
-        if matches!(preserved_child.as_ref(), LogicalPlan::Sort(_)) {
+        if let LogicalPlan::Sort(child_sort) = preserved_child.as_ref() {
+            // Compare using resolved expressions since the parent sort may
+            // reference post-projection column names while the child uses
+            // pre-projection expressions.
+            let same_exprs = child_sort.expr == resolved_sort_exprs;
+            let child_fetch_tighter = match child_sort.fetch {
+                Some(child_fetch) => child_fetch <= fetch,
+                None => false,
+            };
+            if same_exprs && child_fetch_tighter {
+                return Ok(Transformed::no(plan));
+            }
+        }
+
+        // Don't push if any sort expression is non-deterministic (e.g. random()).
+        // Duplicating such expressions would produce different values at each
+        // evaluation point, potentially changing the result.
+        if resolved_sort_exprs.iter().any(|se| se.expr.is_volatile()) {
             return Ok(Transformed::no(plan));
         }
 
-        // Create the new Sort(fetch) on the preserved child
+        // Create the new Sort(fetch) on the preserved child.
+        // Use the resolved expressions (pre-projection) for the pushed Sort.
+        //
+        // If the child is already a Sort with the same expressions but a larger
+        // fetch, tighten its fetch in-place instead of stacking a redundant Sort
+        // on top.
+        let (sort_input, sort_exprs) = match preserved_child.as_ref() {
+            LogicalPlan::Sort(child_sort) if child_sort.expr == resolved_sort_exprs => {
+                (Arc::clone(&child_sort.input), child_sort.expr.clone())
+            }
+            _ => (Arc::clone(preserved_child), resolved_sort_exprs),
+        };
         let new_child_sort = Arc::new(LogicalPlan::Sort(SortPlan {
-            expr: sort.expr.clone(),
-            input: Arc::clone(preserved_child),
+            expr: sort_exprs,
+            input: sort_input,
             fetch: Some(fetch),
         }));
 
@@ -185,6 +237,63 @@ impl OptimizerRule for PushDownTopKThroughJoin {
     }
 }
 
+/// Resolve sort expressions through a projection by replacing column
+/// references with the underlying projection expressions.
+///
+/// For example, if sort expr is `b ASC` and projection has `-t1.b AS b`,
+/// the resolved sort expr becomes `-t1.b ASC`.
+///
+/// Before:
+/// ```text
+/// Sort: b ASC, fetch=3
+///   Projection: -t1.b AS b
+///     Join
+///       t1
+///       t2
+/// ```
+///
+/// After resolving, the pushed Sort uses pre-projection expressions:
+/// ```text
+/// Sort: b ASC, fetch=3
+///   Projection: -t1.b AS b
+///     Join
+///       Sort: -t1.b ASC, fetch=3  ← resolved through projection
+///         t1
+///       t2
+/// ```
+fn resolve_sort_exprs_through_projection(
+    sort_exprs: &[SortExpr],
+    projection: &Projection,
+) -> Result<Vec<SortExpr>> {
+    // Build map: output column name → underlying expression
+    let replace_map: std::collections::HashMap<String, Expr> = projection
+        .schema
+        .iter()
+        .zip(projection.expr.iter())
+        .map(|((qualifier, field), expr)| {
+            let key = Column::from((qualifier, field)).flat_name();
+            (key, expr.clone().unalias())
+        })
+        .collect();
+
+    sort_exprs
+        .iter()
+        .map(|sort_expr| {
+            let new_expr = sort_expr.expr.clone().transform(|expr| {
+                let replacement = match &expr {
+                    Expr::Column(col) => replace_map.get(&col.flat_name()).cloned(),
+                    _ => None,
+                };
+                Ok(replacement.map_or_else(|| Transformed::no(expr), Transformed::yes))
+            })?;
+            Ok(SortExpr {
+                expr: new_expr.data,
+                ..*sort_expr
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -192,7 +301,8 @@ mod test {
     use crate::assert_optimized_plan_eq_snapshot;
     use crate::test::*;
 
-    use datafusion_expr::{col, logical_plan::builder::LogicalPlanBuilder};
+    use datafusion_expr::col;
+    use datafusion_expr::logical_plan::builder::LogicalPlanBuilder;
 
     macro_rules! assert_optimized_plan_equal {
         (
@@ -398,6 +508,214 @@ mod test {
         Sort: t1.b ASC NULLS LAST
           Left Join: t1.a = t2.a
             TableScan: t1
+            TableScan: t2
+        "
+        )
+    }
+
+    /// LEFT SEMI JOIN: TopK on left-side columns → pushed to left child.
+    #[test]
+    fn topk_pushed_for_left_semi_join() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .join(
+                LogicalPlanBuilder::from(t2).build()?,
+                JoinType::LeftSemi,
+                (vec!["a"], vec!["a"]),
+                None,
+            )?
+            .sort_with_limit(vec![col("t1.b").sort(true, false)], Some(3))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Sort: t1.b ASC NULLS LAST, fetch=3
+          LeftSemi Join: t1.a = t2.a
+            Sort: t1.b ASC NULLS LAST, fetch=3
+              TableScan: t1
+            TableScan: t2
+        "
+        )
+    }
+
+    /// LEFT ANTI JOIN: TopK on left-side columns → pushed to left child.
+    #[test]
+    fn topk_pushed_for_left_anti_join() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .join(
+                LogicalPlanBuilder::from(t2).build()?,
+                JoinType::LeftAnti,
+                (vec!["a"], vec!["a"]),
+                None,
+            )?
+            .sort_with_limit(vec![col("t1.b").sort(true, false)], Some(3))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Sort: t1.b ASC NULLS LAST, fetch=3
+          LeftAnti Join: t1.a = t2.a
+            Sort: t1.b ASC NULLS LAST, fetch=3
+              TableScan: t1
+            TableScan: t2
+        "
+        )
+    }
+
+    /// RIGHT SEMI JOIN: TopK on right-side columns → pushed to right child.
+    #[test]
+    fn topk_pushed_for_right_semi_join() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .join(
+                LogicalPlanBuilder::from(t2).build()?,
+                JoinType::RightSemi,
+                (vec!["a"], vec!["a"]),
+                None,
+            )?
+            .sort_with_limit(vec![col("t2.b").sort(true, false)], Some(3))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Sort: t2.b ASC NULLS LAST, fetch=3
+          RightSemi Join: t1.a = t2.a
+            TableScan: t1
+            Sort: t2.b ASC NULLS LAST, fetch=3
+              TableScan: t2
+        "
+        )
+    }
+
+    /// RIGHT ANTI JOIN: TopK on right-side columns → pushed to right child.
+    #[test]
+    fn topk_pushed_for_right_anti_join() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .join(
+                LogicalPlanBuilder::from(t2).build()?,
+                JoinType::RightAnti,
+                (vec!["a"], vec!["a"]),
+                None,
+            )?
+            .sort_with_limit(vec![col("t2.b").sort(true, false)], Some(3))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Sort: t2.b ASC NULLS LAST, fetch=3
+          RightAnti Join: t1.a = t2.a
+            TableScan: t1
+            Sort: t2.b ASC NULLS LAST, fetch=3
+              TableScan: t2
+        "
+        )
+    }
+
+    /// Multi-column sort with columns from both sides → no pushdown.
+    #[test]
+    fn topk_not_pushed_for_mixed_side_sort() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .join(
+                LogicalPlanBuilder::from(t2).build()?,
+                JoinType::Left,
+                (vec!["a"], vec!["a"]),
+                None,
+            )?
+            .sort_with_limit(
+                vec![col("t1.b").sort(true, false), col("t2.b").sort(true, false)],
+                Some(3),
+            )?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Sort: t1.b ASC NULLS LAST, t2.b ASC NULLS LAST, fetch=3
+          Left Join: t1.a = t2.a
+            TableScan: t1
+            TableScan: t2
+        "
+        )
+    }
+
+    /// Preserved child has a larger fetch → push our tighter limit.
+    #[test]
+    fn topk_pushed_when_child_has_larger_fetch() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+
+        // Child already has Sort(b ASC, fetch=10); our outer Sort has fetch=3 (tighter).
+        let t1_with_sort = LogicalPlanBuilder::from(t1)
+            .sort_with_limit(vec![col("t1.b").sort(true, false)], Some(10))?
+            .build()?;
+
+        let plan = LogicalPlanBuilder::from(t1_with_sort)
+            .join(
+                LogicalPlanBuilder::from(t2).build()?,
+                JoinType::Left,
+                (vec!["a"], vec!["a"]),
+                None,
+            )?
+            .sort_with_limit(vec![col("t1.b").sort(true, false)], Some(3))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Sort: t1.b ASC NULLS LAST, fetch=3
+          Left Join: t1.a = t2.a
+            Sort: t1.b ASC NULLS LAST, fetch=3
+              TableScan: t1
+            TableScan: t2
+        "
+        )
+    }
+
+    /// Preserved child already has a tighter fetch → skip pushdown.
+    #[test]
+    fn topk_not_pushed_when_child_has_smaller_fetch() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+
+        // Child already has Sort(b ASC, fetch=2); our outer Sort has fetch=5 (looser).
+        let t1_with_sort = LogicalPlanBuilder::from(t1)
+            .sort_with_limit(vec![col("t1.b").sort(true, false)], Some(2))?
+            .build()?;
+
+        let plan = LogicalPlanBuilder::from(t1_with_sort)
+            .join(
+                LogicalPlanBuilder::from(t2).build()?,
+                JoinType::Left,
+                (vec!["a"], vec!["a"]),
+                None,
+            )?
+            .sort_with_limit(vec![col("t1.b").sort(true, false)], Some(5))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Sort: t1.b ASC NULLS LAST, fetch=5
+          Left Join: t1.a = t2.a
+            Sort: t1.b ASC NULLS LAST, fetch=2
+              TableScan: t1
             TableScan: t2
         "
         )
