@@ -97,6 +97,13 @@ impl OptimizerRule for PushDownTopKThroughJoin {
             return Ok(Transformed::no(plan));
         };
 
+        // Don't push if any sort expression is non-deterministic (e.g. random()).
+        // Duplicating such expressions would produce different values at each
+        // evaluation point, potentially changing the result.
+        if sort.expr.iter().any(|se| se.expr.is_volatile()) {
+            return Ok(Transformed::no(plan));
+        }
+
         // Check if the child is a Join (look through Projection)
         let (has_projection, join) = match sort.input.as_ref() {
             LogicalPlan::Join(join) => (false, join),
@@ -172,13 +179,6 @@ impl OptimizerRule for PushDownTopKThroughJoin {
             if same_exprs && child_fetch_tighter {
                 return Ok(Transformed::no(plan));
             }
-        }
-
-        // Don't push if any sort expression is non-deterministic (e.g. random()).
-        // Duplicating such expressions would produce different values at each
-        // evaluation point, potentially changing the result.
-        if resolved_sort_exprs.iter().any(|se| se.expr.is_volatile()) {
-            return Ok(Transformed::no(plan));
         }
 
         // Create the new Sort(fetch) on the preserved child.
