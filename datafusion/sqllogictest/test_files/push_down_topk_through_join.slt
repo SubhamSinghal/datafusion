@@ -259,7 +259,7 @@ ORDER BY b ASC LIMIT 2;
 
 # Child has smaller fetch with same sort: our rule skips (already tighter).
 # PushDownLimit inserts a Sort(fetch=5) that gets collapsed with the inner
-# Sort(fetch=2) to Sort(fetch=2) by stacked-sort merging.
+# Sort(fetch=2) to Sort(fetch=2)
 query TT
 EXPLAIN SELECT * FROM (
     SELECT t1.a, t1.b, t2.x
