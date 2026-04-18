@@ -473,7 +473,7 @@ ORDER BY b ASC LIMIT 2;
 2 20 2
 
 # RIGHT JOIN with SubqueryAlias on preserved (right) side
-# Inner Sort(fetch=10) is tightened to fetch=3 via stacked-sort merging.
+# Inner Sort(fetch=10) is tightened to fetch=3
 query TT
 EXPLAIN SELECT * FROM (
     SELECT t1.a, t2.x, t2.y
