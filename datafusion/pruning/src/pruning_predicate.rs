@@ -1533,32 +1533,30 @@ fn build_predicate_expression(
                     max_val = Some(v);
                 }
             }
-            if all_literals {
-                if let (Some(min_val), Some(max_val)) = (min_val, max_val) {
-                    let min_lit = Arc::new(phys_expr::Literal::new(min_val.clone()))
-                        as Arc<dyn PhysicalExpr>;
-                    let max_lit = Arc::new(phys_expr::Literal::new(max_val.clone()))
-                        as Arc<dyn PhysicalExpr>;
-                    let range_expr = Arc::new(phys_expr::BinaryExpr::new(
-                        Arc::new(phys_expr::BinaryExpr::new(
-                            Arc::clone(in_list.expr()),
-                            Operator::GtEq,
-                            min_lit,
-                        )),
-                        Operator::And,
-                        Arc::new(phys_expr::BinaryExpr::new(
-                            Arc::clone(in_list.expr()),
-                            Operator::LtEq,
-                            max_lit,
-                        )),
-                    )) as Arc<dyn PhysicalExpr>;
-                    return build_predicate_expression(
-                        &range_expr,
-                        schema,
-                        required_columns,
-                        unhandled_hook,
-                    );
-                }
+            if all_literals && let (Some(min_val), Some(max_val)) = (min_val, max_val) {
+                let min_lit = Arc::new(phys_expr::Literal::new(min_val.clone()))
+                    as Arc<dyn PhysicalExpr>;
+                let max_lit = Arc::new(phys_expr::Literal::new(max_val.clone()))
+                    as Arc<dyn PhysicalExpr>;
+                let range_expr = Arc::new(phys_expr::BinaryExpr::new(
+                    Arc::new(phys_expr::BinaryExpr::new(
+                        Arc::clone(in_list.expr()),
+                        Operator::GtEq,
+                        min_lit,
+                    )),
+                    Operator::And,
+                    Arc::new(phys_expr::BinaryExpr::new(
+                        Arc::clone(in_list.expr()),
+                        Operator::LtEq,
+                        max_lit,
+                    )),
+                )) as Arc<dyn PhysicalExpr>;
+                return build_predicate_expression(
+                    &range_expr,
+                    schema,
+                    required_columns,
+                    unhandled_hook,
+                );
             }
             return unhandled_hook.handle(expr);
         } else {
