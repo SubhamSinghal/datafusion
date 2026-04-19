@@ -562,6 +562,31 @@ impl HashJoinStream {
         }
 
         self.build_side = BuildSide::Ready(BuildSideReadyState { left_data });
+
+        // If the build side was projected to fewer columns, remap column indices
+        // so they reference the projected batch positions instead of the original schema.
+        if let BuildSide::Ready(ref ready) = self.build_side
+            && let Some(remap) = ready.left_data.build_column_remap()
+        {
+            self.column_indices = super::exec::remap_column_indices(
+                &self.column_indices,
+                remap,
+                JoinSide::Left,
+            );
+            if let Some(ref filter) = self.filter {
+                let remapped_filter_indices = super::exec::remap_column_indices(
+                    filter.column_indices(),
+                    remap,
+                    JoinSide::Left,
+                );
+                self.filter = Some(JoinFilter::new(
+                    Arc::clone(filter.expression()),
+                    remapped_filter_indices,
+                    Arc::clone(filter.schema()),
+                ));
+            }
+        }
+
         Poll::Ready(Ok(StatefulStreamResult::Continue))
     }
 
