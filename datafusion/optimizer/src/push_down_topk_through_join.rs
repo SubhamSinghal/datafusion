@@ -403,7 +403,9 @@ fn resolve_sort_exprs_through_projection(
 }
 
 /// Compare two slices of `SortExpr` for equality.
-/// Uses structural equality on the sort expressions
+///
+/// Uses structural equality on the sort expressions (direction, nulls_first,
+/// and the expression tree).
 fn sort_exprs_equal(a: &[SortExpr], b: &[SortExpr]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b.iter()).all(|(left, right)| {
@@ -864,5 +866,205 @@ mod test {
             TableScan: t2
         "
         )
+    }
+
+    // ---------------------------------------------------------------
+    // Unit tests for resolve_sort_exprs_through_projection
+    // ---------------------------------------------------------------
+
+    /// Simple passthrough: sort on a column that projection passes through.
+    /// Projection: [t1.a, t1.b] → sort on t1.b resolves to t1.b
+    #[test]
+    fn resolve_through_projection_passthrough() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .project(vec![col("t1.a"), col("t1.b")])?
+            .build()?;
+        let LogicalPlan::Projection(proj) = &plan else {
+            panic!("expected Projection");
+        };
+
+        let sort_exprs = vec![col("t1.b").sort(true, false)];
+        let resolved = resolve_sort_exprs_through_projection(&sort_exprs, proj)?;
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].expr.to_string(), "t1.b");
+        assert!(resolved[0].asc);
+        Ok(())
+    }
+
+    /// Aliased expression: sort on neg_b resolves to (- t1.b)
+    #[test]
+    fn resolve_through_projection_alias() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .project(vec![
+                col("t1.a"),
+                (Expr::Negative(Box::new(col("t1.b")))).alias("neg_b"),
+            ])?
+            .build()?;
+        let LogicalPlan::Projection(proj) = &plan else {
+            panic!("expected Projection");
+        };
+
+        let sort_exprs = vec![col("neg_b").sort(true, false)];
+        let resolved = resolve_sort_exprs_through_projection(&sort_exprs, proj)?;
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].expr.to_string(), "(- t1.b)");
+        Ok(())
+    }
+
+    /// Multiple columns through projection: sort on (t1.a, t1.b)
+    #[test]
+    fn resolve_through_projection_multi_column() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .project(vec![col("t1.a"), col("t1.b"), col("t1.c")])?
+            .build()?;
+        let LogicalPlan::Projection(proj) = &plan else {
+            panic!("expected Projection");
+        };
+
+        let sort_exprs =
+            vec![col("t1.a").sort(true, false), col("t1.b").sort(false, true)];
+        let resolved = resolve_sort_exprs_through_projection(&sort_exprs, proj)?;
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].expr.to_string(), "t1.a");
+        assert!(resolved[0].asc);
+        assert_eq!(resolved[1].expr.to_string(), "t1.b");
+        assert!(!resolved[1].asc);
+        assert!(resolved[1].nulls_first);
+        Ok(())
+    }
+
+    /// Projection + SubqueryAlias stacked: sort resolves through both.
+    /// neg_b → (- sub.b) through Projection → (- t1.b) through SubqueryAlias
+    #[test]
+    fn resolve_through_projection_and_subquery_alias() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .alias("sub")?
+            .project(vec![
+                col("sub.a"),
+                (Expr::Negative(Box::new(col("sub.b")))).alias("neg_b"),
+            ])?
+            .build()?;
+
+        // Peel: Projection then SubqueryAlias
+        let LogicalPlan::Projection(proj) = &plan else {
+            panic!("expected Projection");
+        };
+        let LogicalPlan::SubqueryAlias(sq) = proj.input.as_ref() else {
+            panic!("expected SubqueryAlias");
+        };
+
+        let sort_exprs = vec![col("neg_b").sort(true, false)];
+
+        // Resolve through Projection: neg_b → (- sub.b)
+        let after_proj = resolve_sort_exprs_through_projection(&sort_exprs, proj)?;
+        assert_eq!(after_proj[0].expr.to_string(), "(- sub.b)");
+
+        // Resolve through SubqueryAlias: (- sub.b) → (- t1.b)
+        let after_sq = resolve_sort_exprs_through_subquery_alias(&after_proj, sq)?;
+        assert_eq!(after_sq[0].expr.to_string(), "(- t1.b)");
+        assert!(after_sq[0].asc);
+        assert!(!after_sq[0].nulls_first);
+
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // Unit tests for resolve_sort_exprs_through_subquery_alias
+    // ---------------------------------------------------------------
+
+    /// Simple column rename: sub.b → t1.b
+    #[test]
+    fn resolve_through_subquery_alias_simple() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+
+        let plan = LogicalPlanBuilder::from(t1).alias("sub")?.build()?;
+        let LogicalPlan::SubqueryAlias(sq) = &plan else {
+            panic!("expected SubqueryAlias");
+        };
+
+        let sort_exprs = vec![col("sub.b").sort(true, false)];
+        let resolved = resolve_sort_exprs_through_subquery_alias(&sort_exprs, sq)?;
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].expr.to_string(), "t1.b");
+        assert!(resolved[0].asc);
+        assert!(!resolved[0].nulls_first);
+        Ok(())
+    }
+
+    /// Multiple sort columns: sub.a ASC, sub.b DESC → t1.a ASC, t1.b DESC
+    #[test]
+    fn resolve_through_subquery_alias_multi_column() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+
+        let plan = LogicalPlanBuilder::from(t1).alias("sub")?.build()?;
+        let LogicalPlan::SubqueryAlias(sq) = &plan else {
+            panic!("expected SubqueryAlias");
+        };
+
+        let sort_exprs = vec![
+            col("sub.a").sort(true, false),
+            col("sub.b").sort(false, true),
+        ];
+        let resolved = resolve_sort_exprs_through_subquery_alias(&sort_exprs, sq)?;
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].expr.to_string(), "t1.a");
+        assert!(resolved[0].asc);
+        assert_eq!(resolved[1].expr.to_string(), "t1.b");
+        assert!(!resolved[1].asc);
+        assert!(resolved[1].nulls_first);
+        Ok(())
+    }
+
+    /// Alias name differs from table name: foo.b → t1.b
+    #[test]
+    fn resolve_through_subquery_alias_different_name() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+
+        let plan = LogicalPlanBuilder::from(t1).alias("foo")?.build()?;
+        let LogicalPlan::SubqueryAlias(sq) = &plan else {
+            panic!("expected SubqueryAlias");
+        };
+
+        let sort_exprs = vec![col("foo.b").sort(true, false)];
+        let resolved = resolve_sort_exprs_through_subquery_alias(&sort_exprs, sq)?;
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].expr.to_string(), "t1.b");
+        Ok(())
+    }
+
+    /// Nested expression: (- sub.b) ASC → (- t1.b) ASC
+    #[test]
+    fn resolve_through_subquery_alias_nested_expr() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+
+        let plan = LogicalPlanBuilder::from(t1).alias("sub")?.build()?;
+        let LogicalPlan::SubqueryAlias(sq) = &plan else {
+            panic!("expected SubqueryAlias");
+        };
+
+        let sort_exprs = vec![SortExpr {
+            expr: Expr::Negative(Box::new(col("sub.b"))),
+            asc: true,
+            nulls_first: false,
+        }];
+        let resolved = resolve_sort_exprs_through_subquery_alias(&sort_exprs, sq)?;
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].expr.to_string(), "(- t1.b)");
+        Ok(())
     }
 }
