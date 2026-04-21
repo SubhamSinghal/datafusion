@@ -402,19 +402,14 @@ fn resolve_sort_exprs_through_projection(
     replace_columns_in_sort_exprs(sort_exprs, &replace_map)
 }
 
-/// Compare two slices of `SortExpr` using `Expr::to_string()` for column identity.
-///
-/// `Column` derives `PartialEq` which compares the `relation` field
-/// (`Option<TableReference>`) structurally.  A `Bare("t1")` and
-/// `Full { catalog, schema, table: "t1" }` are NOT equal even though they
-/// refer to the same column.  After resolving through SubqueryAlias the
-/// variant may differ, so we compare by display string instead.
+/// Compare two slices of `SortExpr` for equality.
+/// Uses structural equality on the sort expressions
 fn sort_exprs_equal(a: &[SortExpr], b: &[SortExpr]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b.iter()).all(|(left, right)| {
             left.asc == right.asc
                 && left.nulls_first == right.nulls_first
-                && left.expr.to_string() == right.expr.to_string()
+                && left.expr == right.expr
         })
 }
 
