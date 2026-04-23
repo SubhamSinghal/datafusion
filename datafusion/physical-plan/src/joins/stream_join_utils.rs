@@ -116,7 +116,7 @@ impl JoinHashMapType for PruningJoinHashMap {
         predicate: &mut dyn FnMut(u64) -> bool,
     ) -> Option<u64> {
         let next: Vec<u64> = self.next.iter().copied().collect();
-        get_first_match_impl::<u64>(&self.map, &next, hash_value, predicate)
+        get_first_match_impl::<u64>(&self.map, next, hash_value, predicate)
     }
 }
 

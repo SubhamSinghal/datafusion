@@ -339,7 +339,7 @@ use crate::joins::chain::traverse_chain;
 /// Returns the first build-side row in the collision chain where `predicate` is true.
 pub fn get_first_match_impl<T>(
     map: &HashTable<(u64, T)>,
-    next_chain: &[T],
+    next_chain: impl AsRef<[T]>,
     hash_value: u64,
     predicate: &mut dyn FnMut(u64) -> bool,
 ) -> Option<u64>
@@ -347,6 +347,7 @@ where
     T: Copy + TryFrom<usize> + PartialOrd + Into<u64> + Sub<Output = T>,
     <T as TryFrom<usize>>::Error: Debug,
 {
+    let next_chain = next_chain.as_ref();
     let zero = T::try_from(0).unwrap();
     let one = T::try_from(1).unwrap();
 
