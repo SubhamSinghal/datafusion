@@ -17,15 +17,13 @@
 
 //! [`EliminateOuterJoin`] converts `LEFT/RIGHT/FULL` joins to `INNER` joins
 use crate::{OptimizerConfig, OptimizerRule};
-use datafusion_common::Result;
-use datafusion_expr::Filter;
+use datafusion_common::{Column, DFSchema, Result};
 use datafusion_expr::logical_plan::{Join, JoinType, LogicalPlan};
+use datafusion_expr::{Expr, Filter, Operator};
 
 use crate::optimizer::ApplyOrder;
 use datafusion_common::tree_node::Transformed;
-use datafusion_expr::execution_props::ExecutionProps;
-use datafusion_physical_expr::create_physical_expr;
-use std::collections::HashSet;
+use datafusion_expr::expr::{BinaryExpr, Cast, InList, Like, TryCast};
 use std::sync::Arc;
 
 ///
@@ -82,44 +80,32 @@ impl OptimizerRule for EliminateOuterJoin {
         match plan {
             LogicalPlan::Filter(mut filter) => match Arc::unwrap_or_clone(filter.input) {
                 LogicalPlan::Join(join) => {
+                    let mut non_nullable_cols: Vec<Column> = vec![];
+
+                    extract_non_nullable_columns(
+                        &filter.predicate,
+                        &mut non_nullable_cols,
+                        join.left.schema(),
+                        join.right.schema(),
+                        true,
+                    );
+
                     let new_join_type = if join.join_type.is_outer() {
-                        let left_field_count = join.left.schema().fields().len();
-                        let total_field_count = join.schema.fields().len();
-
-                        // Convert predicate to physical expression for
-                        // null-rejection analysis via is_not_true.
-                        // If conversion fails (e.g. type mismatch), skip
-                        // the optimization and keep the original join type.
-                        let execution_props = ExecutionProps::default();
-                        match create_physical_expr(
-                            &filter.predicate,
-                            join.schema.as_ref(),
-                            &execution_props,
-                        ) {
-                            Ok(physical_predicate) => {
-                                // In an outer join, the null-supplying side has ALL
-                                // its columns set to NULL simultaneously. So we check
-                                // null-rejection for all columns of each side at once.
-                                let left_columns: HashSet<usize> =
-                                    (0..left_field_count).collect();
-                                let right_columns: HashSet<usize> =
-                                    (left_field_count..total_field_count).collect();
-
-                                let left_non_nullable = physical_predicate
-                                    .is_not_true(&left_columns)
-                                    == Some(true);
-                                let right_non_nullable = physical_predicate
-                                    .is_not_true(&right_columns)
-                                    == Some(true);
-
-                                eliminate_outer(
-                                    join.join_type,
-                                    left_non_nullable,
-                                    right_non_nullable,
-                                )
+                        let mut left_non_nullable = false;
+                        let mut right_non_nullable = false;
+                        for col in non_nullable_cols.iter() {
+                            if join.left.schema().has_column(col) {
+                                left_non_nullable = true;
                             }
-                            Err(_) => join.join_type,
+                            if join.right.schema().has_column(col) {
+                                right_non_nullable = true;
+                            }
                         }
+                        eliminate_outer(
+                            join.join_type,
+                            left_non_nullable,
+                            right_non_nullable,
+                        )
                     } else {
                         join.join_type
                     };
@@ -179,20 +165,204 @@ pub fn eliminate_outer(
     new_join_type
 }
 
+/// Recursively traverses expr, if expr returns false when
+/// any inputs are null, treats columns of both sides as non_nullable columns.
+///
+/// For and/or expr, extracts from all sub exprs and merges the columns.
+/// For or expr, if one of sub exprs returns true, discards all columns from or expr.
+/// For IS NOT NULL/NOT expr, always returns false for NULL input.
+///     extracts columns from these exprs.
+/// For all other exprs, fall through
+fn extract_non_nullable_columns(
+    expr: &Expr,
+    non_nullable_cols: &mut Vec<Column>,
+    left_schema: &Arc<DFSchema>,
+    right_schema: &Arc<DFSchema>,
+    top_level: bool,
+) {
+    match expr {
+        Expr::Column(col) => {
+            non_nullable_cols.push(col.clone());
+        }
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+            // If one of the inputs are null for these operators, the results should be false.
+            Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq => {
+                extract_non_nullable_columns(
+                    left,
+                    non_nullable_cols,
+                    left_schema,
+                    right_schema,
+                    false,
+                );
+                extract_non_nullable_columns(
+                    right,
+                    non_nullable_cols,
+                    left_schema,
+                    right_schema,
+                    false,
+                )
+            }
+            Operator::And | Operator::Or => {
+                // treat And as Or if does not from top level, such as
+                // not (c1 < 10 and c2 > 100)
+                if top_level && *op == Operator::And {
+                    extract_non_nullable_columns(
+                        left,
+                        non_nullable_cols,
+                        left_schema,
+                        right_schema,
+                        top_level,
+                    );
+                    extract_non_nullable_columns(
+                        right,
+                        non_nullable_cols,
+                        left_schema,
+                        right_schema,
+                        top_level,
+                    );
+                    return;
+                }
+
+                let mut left_non_nullable_cols: Vec<Column> = vec![];
+                let mut right_non_nullable_cols: Vec<Column> = vec![];
+
+                extract_non_nullable_columns(
+                    left,
+                    &mut left_non_nullable_cols,
+                    left_schema,
+                    right_schema,
+                    top_level,
+                );
+                extract_non_nullable_columns(
+                    right,
+                    &mut right_non_nullable_cols,
+                    left_schema,
+                    right_schema,
+                    top_level,
+                );
+
+                // for query: select *** from a left join b where b.c1 ... or b.c2 ...
+                // this can be eliminated to inner join.
+                // for query: select *** from a left join b where a.c1 ... or b.c2 ...
+                // this can not be eliminated.
+                // If columns of relation exist in both sub exprs, any columns of this relation
+                // can be added to non nullable columns.
+                if !left_non_nullable_cols.is_empty()
+                    && !right_non_nullable_cols.is_empty()
+                {
+                    for left_col in &left_non_nullable_cols {
+                        for right_col in &right_non_nullable_cols {
+                            if (left_schema.has_column(left_col)
+                                && left_schema.has_column(right_col))
+                                || (right_schema.has_column(left_col)
+                                    && right_schema.has_column(right_col))
+                            {
+                                non_nullable_cols.push(left_col.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
+        Expr::Not(arg) => extract_non_nullable_columns(
+            arg,
+            non_nullable_cols,
+            left_schema,
+            right_schema,
+            false,
+        ),
+        Expr::IsNotNull(arg) => {
+            if !top_level {
+                return;
+            }
+            extract_non_nullable_columns(
+                arg,
+                non_nullable_cols,
+                left_schema,
+                right_schema,
+                false,
+            )
+        }
+        Expr::Cast(Cast { expr, field: _ })
+        | Expr::TryCast(TryCast { expr, field: _ }) => extract_non_nullable_columns(
+            expr,
+            non_nullable_cols,
+            left_schema,
+            right_schema,
+            false,
+        ),
+        // IN list and BETWEEN are null-rejecting on the input expression:
+        // if the input column is NULL, the result is NULL (filtered out),
+        // regardless of whether the list/range contains NULLs.
+        Expr::InList(InList { expr, .. }) => extract_non_nullable_columns(
+            expr,
+            non_nullable_cols,
+            left_schema,
+            right_schema,
+            false,
+        ),
+        Expr::Between(between) => extract_non_nullable_columns(
+            &between.expr,
+            non_nullable_cols,
+            left_schema,
+            right_schema,
+            false,
+        ),
+        // LIKE is null-rejecting: if either the input column or the pattern
+        // is NULL, the result is NULL (filtered out by WHERE).
+        Expr::Like(Like { expr, pattern, .. }) => {
+            extract_non_nullable_columns(
+                expr,
+                non_nullable_cols,
+                left_schema,
+                right_schema,
+                false,
+            );
+            extract_non_nullable_columns(
+                pattern,
+                non_nullable_cols,
+                left_schema,
+                right_schema,
+                false,
+            );
+        }
+        // IS TRUE, IS FALSE, and IS NOT UNKNOWN are null-rejecting:
+        // if the input is NULL, they return false (filtered out by WHERE).
+        // Note: IS NOT TRUE, IS NOT FALSE, and IS UNKNOWN are NOT null-rejecting
+        // because they return true for NULL input.
+        Expr::IsTrue(arg) | Expr::IsFalse(arg) | Expr::IsNotUnknown(arg) => {
+            extract_non_nullable_columns(
+                arg,
+                non_nullable_cols,
+                left_schema,
+                right_schema,
+                false,
+            )
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::OptimizerContext;
     use crate::assert_optimized_plan_eq_snapshot;
     use crate::test::*;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::{Column, ScalarValue};
+    use arrow::datatypes::DataType;
+    use datafusion_common::ScalarValue;
     use datafusion_expr::{
         Operator::{And, Or},
         binary_expr, cast, col, lit,
         logical_plan::builder::LogicalPlanBuilder,
-        logical_plan::table_scan,
-        not, try_cast,
+        try_cast,
     };
 
     macro_rules! assert_optimized_plan_equal {
@@ -209,15 +379,6 @@ mod tests {
                 @ $expected,
             )
         }};
-    }
-
-    fn test_table_scan_with_name_and_utf8(name: &str) -> Result<LogicalPlan> {
-        let schema = Schema::new(vec![
-            Field::new("a", DataType::UInt32, false),
-            Field::new("b", DataType::Utf8, false),
-            Field::new("c", DataType::Utf8, false),
-        ]);
-        table_scan(Some(name), &schema, None)?.build()
     }
 
     #[test]
@@ -541,8 +702,8 @@ mod tests {
 
     #[test]
     fn eliminate_left_with_like() -> Result<()> {
-        let t1 = test_table_scan_with_name_and_utf8("t1")?;
-        let t2 = test_table_scan_with_name_and_utf8("t2")?;
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
 
         // LIKE rejects nulls: if t2.b is NULL, the result is NULL (filtered out)
         let plan = LogicalPlanBuilder::from(t1)
@@ -565,8 +726,8 @@ mod tests {
 
     #[test]
     fn eliminate_left_with_like_pattern_column() -> Result<()> {
-        let t1 = test_table_scan_with_name_and_utf8("t1")?;
-        let t2 = test_table_scan_with_name_and_utf8("t2")?;
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
 
         // LIKE with nullable column on the pattern side:
         // 'x' LIKE t2.b → if t2.b is NULL, result is NULL (filtered out)
@@ -590,8 +751,8 @@ mod tests {
 
     #[test]
     fn eliminate_full_with_like_cross_side() -> Result<()> {
-        let t1 = test_table_scan_with_name_and_utf8("t1")?;
-        let t2 = test_table_scan_with_name_and_utf8("t2")?;
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
 
         // LIKE with columns from both sides: t1.c LIKE t2.b
         // If t1 is NULL → NULL LIKE t2.b → NULL → filtered out (left non-nullable)
@@ -765,85 +926,6 @@ mod tests {
         ")
     }
 
-    #[test]
-    fn eliminate_left_with_negative() -> Result<()> {
-        // Use a table with signed int columns for Negative
-        let schema = Schema::new(vec![
-            Field::new("a", DataType::UInt32, false),
-            Field::new("b", DataType::Int32, false),
-        ]);
-        let t1 = table_scan(Some("t1"), &schema, None)?.build()?;
-        let t2 = table_scan(Some("t2"), &schema, None)?.build()?;
-
-        // -NULL = NULL, so negative is null-rejecting
-        let plan = LogicalPlanBuilder::from(t1)
-            .join(
-                t2,
-                JoinType::Left,
-                (vec![Column::from_name("a")], vec![Column::from_name("a")]),
-                None,
-            )?
-            .filter((-col("t2.b")).gt(lit(0i32)))?
-            .build()?;
-
-        assert_optimized_plan_equal!(plan, @r"
-        Filter: (- t2.b) > Int32(0)
-          Inner Join: t1.a = t2.a
-            TableScan: t1
-            TableScan: t2
-        ")
-    }
-
-    #[test]
-    fn no_eliminate_with_not_is_not_null() -> Result<()> {
-        let t1 = test_table_scan_with_name("t1")?;
-        let t2 = test_table_scan_with_name("t2")?;
-
-        // NOT(IS NOT NULL(col)) = IS NULL(col) — passes when col is NULL
-        // Should NOT eliminate the outer join
-        let plan = LogicalPlanBuilder::from(t1)
-            .join(
-                t2,
-                JoinType::Left,
-                (vec![Column::from_name("a")], vec![Column::from_name("a")]),
-                None,
-            )?
-            .filter(not(col("t2.b").is_not_null()))?
-            .build()?;
-
-        assert_optimized_plan_equal!(plan, @r"
-        Filter: NOT t2.b IS NOT NULL
-          Left Join: t1.a = t2.a
-            TableScan: t1
-            TableScan: t2
-        ")
-    }
-
-    #[test]
-    fn eliminate_left_with_not_comparison() -> Result<()> {
-        let t1 = test_table_scan_with_name("t1")?;
-        let t2 = test_table_scan_with_name("t2")?;
-
-        // NOT(t2.b > 10): when t2.b is NULL, t2.b > 10 = NULL, NOT(NULL) = NULL
-        // NULL is not-true, so this is null-rejecting
-        let plan = LogicalPlanBuilder::from(t1)
-            .join(
-                t2,
-                JoinType::Left,
-                (vec![Column::from_name("a")], vec![Column::from_name("a")]),
-                None,
-            )?
-            .filter(not(col("t2.b").gt(lit(10u32))))?
-            .build()?;
-
-        assert_optimized_plan_equal!(plan, @r"
-        Filter: NOT t2.b > UInt32(10)
-          Inner Join: t1.a = t2.a
-            TableScan: t1
-            TableScan: t2
-        ")
-    }
-
     // ----- FULL JOIN → LEFT / RIGHT tests -----
     #[test]
     fn eliminate_full_to_left_with_left_filter() -> Result<()> {
@@ -896,8 +978,8 @@ mod tests {
 
     #[test]
     fn eliminate_full_to_left_with_like() -> Result<()> {
-        let t1 = test_table_scan_with_name_and_utf8("t1")?;
-        let t2 = test_table_scan_with_name_and_utf8("t2")?;
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
 
         // FULL JOIN with LIKE on left side only → LEFT JOIN
         let plan = LogicalPlanBuilder::from(t1)
@@ -1037,8 +1119,8 @@ mod tests {
 
     #[test]
     fn eliminate_full_with_mixed_predicates() -> Result<()> {
-        let t1 = test_table_scan_with_name_and_utf8("t1")?;
-        let t2 = test_table_scan_with_name_and_utf8("t2")?;
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
 
         // FULL JOIN with different null-rejecting expr types on each side:
         // LIKE on left, BETWEEN on right → INNER JOIN
@@ -1052,12 +1134,12 @@ mod tests {
             .filter(binary_expr(
                 col("t1.b").like(lit("%pattern%")),
                 And,
-                col("t2.b").between(lit("a"), lit("z")),
+                col("t2.b").between(lit(1u32), lit(10u32)),
             ))?
             .build()?;
 
         assert_optimized_plan_equal!(plan, @r#"
-        Filter: t1.b LIKE Utf8("%pattern%") AND t2.b BETWEEN Utf8("a") AND Utf8("z")
+        Filter: t1.b LIKE Utf8("%pattern%") AND t2.b BETWEEN UInt32(1) AND UInt32(10)
           Inner Join: t1.a = t2.a
             TableScan: t1
             TableScan: t2
