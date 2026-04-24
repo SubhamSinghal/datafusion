@@ -1834,6 +1834,7 @@ async fn test_replace_with_partial_sort_for_bounded_input_with_config() -> Resul
     Input Plan:
     SortExec: expr=[a@0 ASC, c@2 ASC], preserve_partitioning=[false]
       DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet
+    
     Optimized Plan:
     PartialSortExec: expr=[a@0 ASC, c@2 ASC], common_prefix_length=[1]
       DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet
