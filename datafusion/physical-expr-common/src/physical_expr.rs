@@ -45,6 +45,18 @@ use itertools::izip;
 /// Shared [`PhysicalExpr`].
 pub type PhysicalExprRef = Arc<dyn PhysicalExpr>;
 
+/// Describes whether a boolean property (like being NULL or not-true)
+/// is guaranteed to hold for an expression given a set of null columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsFalsy {
+    /// The property always holds for any input.
+    Always,
+    /// May or may not hold depending on input values (unknown).
+    Sometimes,
+    /// The property never holds for any input.
+    Never,
+}
+
 /// [`PhysicalExpr`]s represent expressions such as `A + 1` or `CAST(c1 AS int)`.
 ///
 /// `PhysicalExpr` knows its type, nullability and can be evaluated directly on
@@ -72,15 +84,6 @@ pub type PhysicalExprRef = Arc<dyn PhysicalExpr>;
 /// [`Expr`]: https://docs.rs/datafusion/latest/datafusion/logical_expr/enum.Expr.html
 /// [`create_physical_expr`]: https://docs.rs/datafusion/latest/datafusion/physical_expr/fn.create_physical_expr.html
 /// [`Column`]: https://docs.rs/datafusion/latest/datafusion/physical_expr/expressions/struct.Column.html
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IsFalsy {
-    /// The property always holds for any input.
-    Always,
-    /// May or may not hold depending on input values (unknown).
-    Sometimes,
-    /// The property never holds for any input.
-    Never,
-}
 
 pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
     /// Get the data type of this expression, given the schema of the input
