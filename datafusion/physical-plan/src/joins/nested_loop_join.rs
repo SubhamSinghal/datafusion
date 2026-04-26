@@ -17,7 +17,7 @@
 
 //! [`NestedLoopJoinExec`]: joins without equijoin (equality predicates).
 
-use std::fmt::Formatter;
+use std::fmt::{self, Formatter};
 use std::ops::{BitOr, ControlFlow};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -194,7 +194,6 @@ use crate::spill::spill_manager::SpillManager;
 /// Note this structure includes a [`OnceAsync`] that is used to coordinate the
 /// loading of the left side with the processing in each output stream.
 /// Therefore it can not be [`Clone`]
-#[derive(Debug)]
 pub struct NestedLoopJoinExec {
     /// left side
     pub(crate) left: Arc<dyn ExecutionPlan>,
@@ -242,10 +241,23 @@ pub(crate) struct NLJDynamicFilter {
     bound_pairs: Vec<BoundPair>,
 }
 
-impl std::fmt::Debug for NLJDynamicFilter {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        f.debug_struct("NLJDynamicFilter")
-            .field("bound_pairs_count", &self.bound_pairs.len())
+/// Custom Debug that omits `dynamic_filter` — it is optimizer-injected runtime state
+/// (contains `Arc<Mutex<SharedBuildAccumulator>>`) that is not preserved by proto
+/// serialization and would cause roundtrip tests to diverge.
+impl fmt::Debug for NestedLoopJoinExec {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        f.debug_struct("NestedLoopJoinExec")
+            .field("left", &self.left)
+            .field("right", &self.right)
+            .field("filter", &self.filter)
+            .field("join_type", &self.join_type)
+            .field("join_schema", &self.join_schema)
+            .field("build_side_data", &self.build_side_data)
+            .field("left_spill_data", &self.left_spill_data)
+            .field("column_indices", &self.column_indices)
+            .field("projection", &self.projection)
+            .field("metrics", &self.metrics)
+            .field("cache", &self.cache)
             .finish()
     }
 }
@@ -548,7 +560,7 @@ impl NestedLoopJoinExec {
 }
 
 impl DisplayAs for NestedLoopJoinExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 let display_filter = self.filter.as_ref().map_or_else(
