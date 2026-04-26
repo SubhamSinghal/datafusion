@@ -17,6 +17,7 @@
 
 mod kernels;
 
+use crate::IsFalsy;
 use crate::PhysicalExpr;
 use crate::intervals::cp_solver::{propagate_arithmetic, propagate_comparison};
 use std::hash::Hash;
@@ -605,7 +606,7 @@ impl PhysicalExpr for BinaryExpr {
         write_child(f, self.right.as_ref(), precedence)
     }
 
-    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
         match self.op {
             // Comparisons and arithmetic: NULL if either child is NULL
             Operator::Eq
@@ -639,15 +640,16 @@ impl PhysicalExpr for BinaryExpr {
                     self.left.is_null(null_columns),
                     self.right.is_null(null_columns),
                 ) {
-                    (Some(true), _) | (_, Some(true)) => Some(true),
-                    (Some(false), Some(false)) => Some(false),
-                    _ => None,
+                    (IsFalsy::Always, _) | (_, IsFalsy::Always) => IsFalsy::Always,
+                    (IsFalsy::Never, IsFalsy::Never) => IsFalsy::Never,
+                    _ => IsFalsy::Sometimes,
                 }
             }
             // IS DISTINCT FROM / IS NOT DISTINCT FROM never return NULL
-            Operator::IsDistinctFrom | Operator::IsNotDistinctFrom => Some(false),
+            Operator::IsDistinctFrom | Operator::IsNotDistinctFrom => IsFalsy::Never,
             // AND: NULL only when neither side is FALSE and at least one is NULL
             //   FALSE AND NULL = FALSE (not null)
+            //   NULL AND FALSE = FALSE (not null)
             //   NULL AND TRUE = NULL
             //   NULL AND NULL = NULL
             Operator::And => {
@@ -657,23 +659,23 @@ impl PhysicalExpr for BinaryExpr {
                 let r_not_true = self.right.is_not_true(null_columns);
 
                 // If either child is definitely FALSE → AND = FALSE (not null)
-                let l_false = l_not_true == Some(true) && l_null == Some(false);
-                let r_false = r_not_true == Some(true) && r_null == Some(false);
+                let l_false = l_not_true == IsFalsy::Always && l_null == IsFalsy::Never;
+                let r_false = r_not_true == IsFalsy::Always && r_null == IsFalsy::Never;
                 if l_false || r_false {
-                    return Some(false);
+                    return IsFalsy::Never;
                 }
 
                 // If both children definitely not null → AND not null
-                if l_null == Some(false) && r_null == Some(false) {
-                    return Some(false);
+                if l_null == IsFalsy::Never && r_null == IsFalsy::Never {
+                    return IsFalsy::Never;
                 }
 
                 // If both children definitely NULL → AND = NULL
-                if l_null == Some(true) && r_null == Some(true) {
-                    return Some(true);
+                if l_null == IsFalsy::Always && r_null == IsFalsy::Always {
+                    return IsFalsy::Always;
                 }
 
-                None
+                IsFalsy::Sometimes
             }
             // OR: NULL only when neither side is TRUE and at least one is NULL
             //   TRUE OR NULL = TRUE (not null)
@@ -686,52 +688,50 @@ impl PhysicalExpr for BinaryExpr {
                 let r_not_true = self.right.is_not_true(null_columns);
 
                 // If both children definitely not null → OR not null
-                if l_null == Some(false) && r_null == Some(false) {
-                    return Some(false);
+                if l_null == IsFalsy::Never && r_null == IsFalsy::Never {
+                    return IsFalsy::Never;
                 }
 
                 // If both children definitely NULL → OR = NULL
-                if l_null == Some(true) && r_null == Some(true) {
-                    return Some(true);
+                if l_null == IsFalsy::Always && r_null == IsFalsy::Always {
+                    return IsFalsy::Always;
                 }
 
                 // If one child is NULL and other is definitely FALSE → OR = NULL
-                let l_false = l_not_true == Some(true) && l_null == Some(false);
-                let r_false = r_not_true == Some(true) && r_null == Some(false);
-                if (l_null == Some(true) && r_false) || (r_null == Some(true) && l_false)
+                let l_false = l_not_true == IsFalsy::Always && l_null == IsFalsy::Never;
+                let r_false = r_not_true == IsFalsy::Always && r_null == IsFalsy::Never;
+                if (l_null == IsFalsy::Always && r_false)
+                    || (r_null == IsFalsy::Always && l_false)
                 {
-                    return Some(true);
+                    return IsFalsy::Always;
                 }
 
-                None
+                IsFalsy::Sometimes
             }
             // All other operators: unknown
-            _ => None,
+            _ => IsFalsy::Sometimes,
         }
     }
 
-    fn is_not_true(
-        &self,
-        null_columns: &std::collections::HashSet<usize>,
-    ) -> Option<bool> {
+    fn is_not_true(&self, null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
         match self.op {
             // AND: not-true if EITHER child is not-true
             Operator::And => match (
                 self.left.is_not_true(null_columns),
                 self.right.is_not_true(null_columns),
             ) {
-                (Some(true), _) | (_, Some(true)) => Some(true),
-                (Some(false), Some(false)) => Some(false),
-                _ => None,
+                (IsFalsy::Always, _) | (_, IsFalsy::Always) => IsFalsy::Always,
+                (IsFalsy::Never, IsFalsy::Never) => IsFalsy::Never,
+                _ => IsFalsy::Sometimes,
             },
             // OR: not-true only if BOTH children are not-true
             Operator::Or => match (
                 self.left.is_not_true(null_columns),
                 self.right.is_not_true(null_columns),
             ) {
-                (Some(true), Some(true)) => Some(true),
-                (Some(false), _) | (_, Some(false)) => Some(false),
-                _ => None,
+                (IsFalsy::Always, IsFalsy::Always) => IsFalsy::Always,
+                (IsFalsy::Never, _) | (_, IsFalsy::Never) => IsFalsy::Never,
+                _ => IsFalsy::Sometimes,
             },
             // IS DISTINCT FROM: FALSE when both NULL, TRUE when one NULL other not
             //   Never returns NULL.
@@ -740,12 +740,13 @@ impl PhysicalExpr for BinaryExpr {
                 let r_null = self.right.is_null(null_columns);
                 match (l_null, r_null) {
                     // Both NULL → FALSE → not-true
-                    (Some(true), Some(true)) => Some(true),
+                    (IsFalsy::Always, IsFalsy::Always) => IsFalsy::Always,
                     // One NULL, other not → TRUE → passes
-                    (Some(true), Some(false)) | (Some(false), Some(true)) => Some(false),
+                    (IsFalsy::Always, IsFalsy::Never)
+                    | (IsFalsy::Never, IsFalsy::Always) => IsFalsy::Never,
                     // Neither NULL → could be TRUE or FALSE
-                    (Some(false), Some(false)) => None,
-                    _ => None,
+                    (IsFalsy::Never, IsFalsy::Never) => IsFalsy::Sometimes,
+                    _ => IsFalsy::Sometimes,
                 }
             }
             // IS NOT DISTINCT FROM: TRUE when both NULL, FALSE when one NULL other not
@@ -755,12 +756,13 @@ impl PhysicalExpr for BinaryExpr {
                 let r_null = self.right.is_null(null_columns);
                 match (l_null, r_null) {
                     // Both NULL → TRUE → passes
-                    (Some(true), Some(true)) => Some(false),
+                    (IsFalsy::Always, IsFalsy::Always) => IsFalsy::Never,
                     // One NULL, other not → FALSE → not-true
-                    (Some(true), Some(false)) | (Some(false), Some(true)) => Some(true),
+                    (IsFalsy::Always, IsFalsy::Never)
+                    | (IsFalsy::Never, IsFalsy::Always) => IsFalsy::Always,
                     // Neither NULL → could be TRUE or FALSE
-                    (Some(false), Some(false)) => None,
-                    _ => None,
+                    (IsFalsy::Never, IsFalsy::Never) => IsFalsy::Sometimes,
+                    _ => IsFalsy::Sometimes,
                 }
             }
             // All other operators (comparisons, arithmetic):
@@ -769,9 +771,9 @@ impl PhysicalExpr for BinaryExpr {
                 self.left.is_null(null_columns),
                 self.right.is_null(null_columns),
             ) {
-                (Some(true), _) | (_, Some(true)) => Some(true),
-                (Some(false), Some(false)) => Some(false),
-                _ => None,
+                (IsFalsy::Always, _) | (_, IsFalsy::Always) => IsFalsy::Always,
+                (IsFalsy::Never, IsFalsy::Never) => IsFalsy::Never,
+                _ => IsFalsy::Sometimes,
             },
         }
     }

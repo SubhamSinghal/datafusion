@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::IsFalsy;
 use crate::PhysicalExpr;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
@@ -146,22 +147,19 @@ impl PhysicalExpr for LikeExpr {
         self.pattern.fmt_sql(f)
     }
 
-    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
         // NULL LIKE pattern = NULL, expr LIKE NULL = NULL
         match (
             self.expr.is_null(null_columns),
             self.pattern.is_null(null_columns),
         ) {
-            (Some(true), _) | (_, Some(true)) => Some(true),
-            (Some(false), Some(false)) => Some(false),
-            _ => None,
+            (IsFalsy::Always, _) | (_, IsFalsy::Always) => IsFalsy::Always,
+            (IsFalsy::Never, IsFalsy::Never) => IsFalsy::Never,
+            _ => IsFalsy::Sometimes,
         }
     }
 
-    fn is_not_true(
-        &self,
-        null_columns: &std::collections::HashSet<usize>,
-    ) -> Option<bool> {
+    fn is_not_true(&self, null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
         // NULL LIKE pattern = NULL → not-true
         // expr LIKE NULL = NULL → not-true
         self.is_null(null_columns)

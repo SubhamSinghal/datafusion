@@ -21,6 +21,7 @@ use std::fmt::Debug;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use crate::IsFalsy;
 use crate::PhysicalExpr;
 use crate::physical_expr::physical_exprs_bag_equal;
 
@@ -901,15 +902,12 @@ impl PhysicalExpr for InListExpr {
         write!(f, ")")
     }
 
-    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
         // NULL IN (...) = NULL
         self.expr.is_null(null_columns)
     }
 
-    fn is_not_true(
-        &self,
-        null_columns: &std::collections::HashSet<usize>,
-    ) -> Option<bool> {
+    fn is_not_true(&self, null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
         // NULL IN (...) = NULL → not-true
         self.expr.is_null(null_columns)
     }

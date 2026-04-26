@@ -20,6 +20,7 @@
 use std::hash::Hash;
 use std::sync::Arc;
 
+use crate::physical_expr::IsFalsy;
 use crate::physical_expr::PhysicalExpr;
 use arrow::datatypes::FieldRef;
 use arrow::{
@@ -146,15 +147,20 @@ impl PhysicalExpr for Column {
         ExpressionPlacement::Column
     }
 
-    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
-        Some(null_columns.contains(&self.index))
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
+        if null_columns.contains(&self.index) {
+            IsFalsy::Always
+        } else {
+            IsFalsy::Never
+        }
     }
 
-    fn is_not_true(
-        &self,
-        null_columns: &std::collections::HashSet<usize>,
-    ) -> Option<bool> {
-        Some(null_columns.contains(&self.index))
+    fn is_not_true(&self, null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
+        if null_columns.contains(&self.index) {
+            IsFalsy::Always
+        } else {
+            IsFalsy::Never
+        }
     }
 }
 

@@ -20,6 +20,7 @@
 use std::hash::Hash;
 use std::sync::Arc;
 
+use crate::physical_expr::IsFalsy;
 use crate::physical_expr::PhysicalExpr;
 
 use arrow::datatypes::{Field, FieldRef};
@@ -134,22 +135,23 @@ impl PhysicalExpr for Literal {
         ExpressionPlacement::Literal
     }
 
-    fn is_null(&self, _null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
-        Some(self.value.is_null())
+    fn is_null(&self, _null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
+        if self.value.is_null() {
+            IsFalsy::Always
+        } else {
+            IsFalsy::Never
+        }
     }
 
-    fn is_not_true(
-        &self,
-        _null_columns: &std::collections::HashSet<usize>,
-    ) -> Option<bool> {
+    fn is_not_true(&self, _null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
         if self.value.is_null() {
-            return Some(true); // NULL is not-true
+            return IsFalsy::Always; // NULL is not-true
         }
         // Boolean FALSE is not-true; TRUE is not not-true
         if let ScalarValue::Boolean(Some(v)) = &self.value {
-            return Some(!v);
+            return if *v { IsFalsy::Never } else { IsFalsy::Always };
         }
-        Some(false) // non-null non-boolean literal
+        IsFalsy::Never // non-null non-boolean literal
     }
 }
 

@@ -23,6 +23,7 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use crate::IsFalsy;
     use crate::PhysicalExpr;
     use crate::expressions::{
         CastExpr, Column, LikeExpr, Literal, NegativeExpr, binary, col, in_list,
@@ -50,16 +51,16 @@ mod tests {
     #[test]
     fn column_is_null_when_in_null_set() {
         let col = Column::new("a", 0);
-        assert_eq!(col.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(col.is_null(&null_cols(&[1])), Some(false));
-        assert_eq!(col.is_null(&null_cols(&[])), Some(false));
+        assert_eq!(col.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(col.is_null(&null_cols(&[1])), IsFalsy::Never);
+        assert_eq!(col.is_null(&null_cols(&[])), IsFalsy::Never);
     }
 
     #[test]
     fn column_is_not_true_when_in_null_set() {
         let col = Column::new("a", 0);
-        assert_eq!(col.is_not_true(&null_cols(&[0])), Some(true));
-        assert_eq!(col.is_not_true(&null_cols(&[1])), Some(false));
+        assert_eq!(col.is_not_true(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(col.is_not_true(&null_cols(&[1])), IsFalsy::Never);
     }
 
     // ---- Literal ----
@@ -67,15 +68,15 @@ mod tests {
     #[test]
     fn literal_null_is_null() {
         let null_lit = Literal::new(ScalarValue::Int32(None));
-        assert_eq!(null_lit.is_null(&null_cols(&[])), Some(true));
-        assert_eq!(null_lit.is_not_true(&null_cols(&[])), Some(true));
+        assert_eq!(null_lit.is_null(&null_cols(&[])), IsFalsy::Always);
+        assert_eq!(null_lit.is_not_true(&null_cols(&[])), IsFalsy::Always);
     }
 
     #[test]
     fn literal_non_null_is_not_null() {
         let val = Literal::new(ScalarValue::Int32(Some(42)));
-        assert_eq!(val.is_null(&null_cols(&[0, 1])), Some(false));
-        assert_eq!(val.is_not_true(&null_cols(&[0, 1])), Some(false));
+        assert_eq!(val.is_null(&null_cols(&[0, 1])), IsFalsy::Never);
+        assert_eq!(val.is_not_true(&null_cols(&[0, 1])), IsFalsy::Never);
     }
 
     // ---- BinaryExpr: Comparisons ----
@@ -85,10 +86,10 @@ mod tests {
         let s = schema();
         // a > 5: when a (index 0) is null → NULL
         let expr = binary(col("a", &s)?, Operator::Gt, lit(5i32), &s)?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_not_true(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_not_true(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -97,10 +98,10 @@ mod tests {
         let s = schema();
         // a = b: when either is null → NULL
         let expr = binary(col("a", &s)?, Operator::Eq, col("b", &s)?, &s)?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[0, 1])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[2])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[0, 1])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[2])), IsFalsy::Never);
         Ok(())
     }
 
@@ -117,11 +118,11 @@ mod tests {
             &s,
         )?;
         // a is null → left side not-true → AND not-true
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
         // b is null → right side not-true → AND not-true
-        assert_eq!(expr.is_not_true(&null_cols(&[1])), Some(true));
+        assert_eq!(expr.is_not_true(&null_cols(&[1])), IsFalsy::Always);
         // neither null → both sides could be true
-        assert_eq!(expr.is_not_true(&null_cols(&[2])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[2])), IsFalsy::Never);
         Ok(())
     }
 
@@ -139,15 +140,16 @@ mod tests {
         //   b > 10 could be TRUE → NULL AND TRUE = NULL
         //   b > 10 could be FALSE → NULL AND FALSE = FALSE
         //   Can't determine → None
-        assert_eq!(expr.is_null(&null_cols(&[0])), None);
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Sometimes);
 
         // Both null: NULL AND NULL = NULL
-        assert_eq!(expr.is_null(&null_cols(&[0, 1])), Some(true));
+        assert_eq!(expr.is_null(&null_cols(&[0, 1])), IsFalsy::Always);
 
         // Neither null: not null
-        assert_eq!(expr.is_null(&null_cols(&[2])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[2])), IsFalsy::Never);
         Ok(())
     }
+
     #[test]
     fn and_is_null_with_false_child() -> Result<()> {
         let s = schema();
@@ -159,8 +161,8 @@ mod tests {
             &s,
         )?;
         // FALSE AND NULL = FALSE → not null
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(false));
-        assert_eq!(expr.is_null(&null_cols(&[])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(expr.is_null(&null_cols(&[])), IsFalsy::Never);
         Ok(())
     }
 
@@ -177,9 +179,9 @@ mod tests {
             &s,
         )?;
         // only a is null → right side could be true → OR not guaranteed not-true
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
         // both null → both sides not-true → OR not-true
-        assert_eq!(expr.is_not_true(&null_cols(&[0, 1])), Some(true));
+        assert_eq!(expr.is_not_true(&null_cols(&[0, 1])), IsFalsy::Always);
         Ok(())
     }
 
@@ -189,8 +191,8 @@ mod tests {
     fn is_distinct_from_never_null() -> Result<()> {
         let s = schema();
         let expr = binary(col("a", &s)?, Operator::IsDistinctFrom, col("b", &s)?, &s)?;
-        assert_eq!(expr.is_null(&null_cols(&[0, 1])), Some(false));
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0, 1])), IsFalsy::Never);
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -199,7 +201,7 @@ mod tests {
         let s = schema();
         // a IS DISTINCT FROM b: when both NULL → FALSE → not-true
         let expr = binary(col("a", &s)?, Operator::IsDistinctFrom, col("b", &s)?, &s)?;
-        assert_eq!(expr.is_not_true(&null_cols(&[0, 1])), Some(true));
+        assert_eq!(expr.is_not_true(&null_cols(&[0, 1])), IsFalsy::Always);
         Ok(())
     }
 
@@ -208,8 +210,8 @@ mod tests {
         let s = schema();
         // a IS DISTINCT FROM b: when only a is NULL → TRUE → passes
         let expr = binary(col("a", &s)?, Operator::IsDistinctFrom, col("b", &s)?, &s)?;
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(false));
-        assert_eq!(expr.is_not_true(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(expr.is_not_true(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -223,7 +225,7 @@ mod tests {
             col("b", &s)?,
             &s,
         )?;
-        assert_eq!(expr.is_not_true(&null_cols(&[0, 1])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[0, 1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -237,8 +239,8 @@ mod tests {
             col("b", &s)?,
             &s,
         )?;
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_not_true(&null_cols(&[1])), Some(true));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_not_true(&null_cols(&[1])), IsFalsy::Always);
         Ok(())
     }
 
@@ -248,9 +250,9 @@ mod tests {
         // Physical representation of IS TRUE(a): a IS NOT DISTINCT FROM true
         // When a is NULL → NULL IS NOT DISTINCT FROM true = FALSE → not-true (rejected)
         let expr = binary(col("a", &s)?, Operator::IsNotDistinctFrom, lit(true), &s)?;
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
         // When a is not null → could be TRUE or FALSE
-        assert_eq!(expr.is_not_true(&null_cols(&[1])), None);
+        assert_eq!(expr.is_not_true(&null_cols(&[1])), IsFalsy::Sometimes);
         Ok(())
     }
 
@@ -260,9 +262,9 @@ mod tests {
         // Physical representation of IS NOT TRUE(a): a IS DISTINCT FROM true
         // When a is NULL → NULL IS DISTINCT FROM true = TRUE → passes
         let expr = binary(col("a", &s)?, Operator::IsDistinctFrom, lit(true), &s)?;
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
         // When a is not null → could be TRUE or FALSE
-        assert_eq!(expr.is_not_true(&null_cols(&[1])), None);
+        assert_eq!(expr.is_not_true(&null_cols(&[1])), IsFalsy::Sometimes);
         Ok(())
     }
 
@@ -273,8 +275,8 @@ mod tests {
         let s = schema();
         // NOT(a > 5): when a is null → a > 5 is NULL → NOT(NULL) = NULL → not-true
         let expr = not(binary(col("a", &s)?, Operator::Gt, lit(5i32), &s)?)?;
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_not_true(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_not_true(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -284,7 +286,7 @@ mod tests {
         // NOT(IS NOT NULL(a)): when a is NULL → IS NOT NULL(NULL) = FALSE →
         // NOT(FALSE) = TRUE → passes filter → should NOT be null-rejecting
         let expr = not(is_not_null(col("a", &s)?)?)?;
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -295,8 +297,8 @@ mod tests {
         let s = schema();
         let expr = is_null(col("a", &s)?)?;
         // IS NULL(NULL) = TRUE → passes filter
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(false));
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -307,10 +309,10 @@ mod tests {
         let s = schema();
         let expr = is_not_null(col("a", &s)?)?;
         // IS NOT NULL(NULL) = FALSE → rejected
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(false));
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
         // IS NOT NULL(non-null) = TRUE → passes
-        assert_eq!(expr.is_not_true(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -320,9 +322,9 @@ mod tests {
     fn cast_propagates_null() -> Result<()> {
         let s = schema();
         let expr = Arc::new(CastExpr::new(col("a", &s)?, DataType::Int64, None));
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
         Ok(())
     }
 
@@ -332,9 +334,9 @@ mod tests {
     fn try_cast_propagates_null() -> Result<()> {
         let s = schema();
         let expr = try_cast(col("a", &s)?, &s, DataType::Int64)?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -344,9 +346,9 @@ mod tests {
     fn negative_propagates_null() -> Result<()> {
         let s = schema();
         let expr = Arc::new(NegativeExpr::new(col("a", &s)?));
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
         Ok(())
     }
 
@@ -357,9 +359,9 @@ mod tests {
         let s = schema();
         // c LIKE '%foo': when c (index 2) is null → NULL
         let expr = Arc::new(LikeExpr::new(false, false, col("c", &s)?, lit("%foo")));
-        assert_eq!(expr.is_null(&null_cols(&[2])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(false));
-        assert_eq!(expr.is_not_true(&null_cols(&[2])), Some(true));
+        assert_eq!(expr.is_null(&null_cols(&[2])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(expr.is_not_true(&null_cols(&[2])), IsFalsy::Always);
         Ok(())
     }
 
@@ -375,9 +377,9 @@ mod tests {
             &false,
             &s,
         )?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
         Ok(())
     }
 
@@ -388,9 +390,9 @@ mod tests {
         let s = schema();
         // a + b: null if either is null
         let expr = binary(col("a", &s)?, Operator::Plus, col("b", &s)?, &s)?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[2])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[2])), IsFalsy::Never);
         Ok(())
     }
 
@@ -409,8 +411,8 @@ mod tests {
             )],
             Some(lit(false)),
         )?;
-        assert_eq!(case_expr.is_null(&null_cols(&[0])), Some(false));
-        assert_eq!(case_expr.is_not_true(&null_cols(&[0])), Some(false));
+        assert_eq!(case_expr.is_null(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(case_expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -427,8 +429,8 @@ mod tests {
             )],
             None,
         )?;
-        assert_eq!(case_expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(case_expr.is_not_true(&null_cols(&[0])), Some(true));
+        assert_eq!(case_expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(case_expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
         Ok(())
     }
 
@@ -436,7 +438,7 @@ mod tests {
     fn case_mixed_branches() -> Result<()> {
         let s = schema();
         // CASE WHEN a > 5 THEN NULL ELSE 42 END
-        // THEN is NULL, ELSE is not → not all NULL → Some(false)
+        // THEN is NULL, ELSE is not → not all NULL → IsFalsy::Never
         let case_expr = crate::expressions::CaseExpr::try_new(
             None,
             vec![(
@@ -445,7 +447,7 @@ mod tests {
             )],
             Some(lit(42i32)),
         )?;
-        assert_eq!(case_expr.is_null(&null_cols(&[0])), Some(false));
+        assert_eq!(case_expr.is_null(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -463,7 +465,7 @@ mod tests {
             Some(lit(0i32)),
         )?;
         // THEN is null when a null, but ELSE is not → not all branches null
-        assert_eq!(case_expr.is_null(&null_cols(&[0])), Some(false));
+        assert_eq!(case_expr.is_null(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -480,8 +482,8 @@ mod tests {
             )],
             None,
         )?;
-        assert_eq!(case_expr.is_null(&null_cols(&[0])), Some(false));
-        assert_eq!(case_expr.is_not_true(&null_cols(&[0])), Some(false));
+        assert_eq!(case_expr.is_null(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(case_expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -498,8 +500,8 @@ mod tests {
             )],
             None,
         )?;
-        assert_eq!(case_expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(case_expr.is_not_true(&null_cols(&[0])), Some(true));
+        assert_eq!(case_expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(case_expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
         Ok(())
     }
 
@@ -514,8 +516,8 @@ mod tests {
             vec![(lit(ScalarValue::Boolean(None)), lit(42i32))],
             Some(lit(0i32)),
         )?;
-        assert_eq!(case_expr.is_null(&null_cols(&[0])), Some(false));
-        assert_eq!(case_expr.is_not_true(&null_cols(&[0])), Some(false));
+        assert_eq!(case_expr.is_null(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(case_expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -531,8 +533,8 @@ mod tests {
             )],
             Some(lit(ScalarValue::Int32(None))),
         )?;
-        assert_eq!(case_expr.is_null(&null_cols(&[])), Some(true));
-        assert_eq!(case_expr.is_not_true(&null_cols(&[])), Some(true));
+        assert_eq!(case_expr.is_null(&null_cols(&[])), IsFalsy::Always);
+        assert_eq!(case_expr.is_not_true(&null_cols(&[])), IsFalsy::Always);
         Ok(())
     }
 
@@ -550,7 +552,7 @@ mod tests {
             &s,
         )?;
         // Should NOT reject: IS NULL(NULL)=TRUE makes OR true
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -562,7 +564,7 @@ mod tests {
         // But IS NULL never returns NULL → is_null returns false →
         // NOT.is_not_true = is_null(inner) = false
         let expr = not(is_null(col("a", &s)?)?)?;
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -577,7 +579,7 @@ mod tests {
             binary(col("b", &s)?, Operator::Gt, lit(10i32), &s)?,
             &s,
         )?;
-        assert_eq!(expr.is_not_true(&null_cols(&[2])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[2])), IsFalsy::Never);
         Ok(())
     }
 
@@ -593,7 +595,7 @@ mod tests {
         )?;
         // lit(true) is not null and not not-true → is_not_true = false
         // OR requires BOTH to be not-true → false
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -608,8 +610,8 @@ mod tests {
             &s,
         )?;
         // Even when a is NOT null, the NULL literal makes result NULL → not-true
-        assert_eq!(expr.is_null(&null_cols(&[])), Some(true));
-        assert_eq!(expr.is_not_true(&null_cols(&[])), Some(true));
+        assert_eq!(expr.is_null(&null_cols(&[])), IsFalsy::Always);
+        assert_eq!(expr.is_not_true(&null_cols(&[])), IsFalsy::Always);
         Ok(())
     }
 
@@ -618,8 +620,8 @@ mod tests {
         let s = schema();
         // a > 5 with no null columns → could be true → not rejected
         let expr = binary(col("a", &s)?, Operator::Gt, lit(5i32), &s)?;
-        assert_eq!(expr.is_null(&null_cols(&[])), Some(false));
-        assert_eq!(expr.is_not_true(&null_cols(&[])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[])), IsFalsy::Never);
+        assert_eq!(expr.is_not_true(&null_cols(&[])), IsFalsy::Never);
         Ok(())
     }
 
@@ -634,8 +636,8 @@ mod tests {
         // Outer NOT: is_not_true calls is_null(NOT(a > 5))
         //   NOT.is_null calls inner.is_null = is_null(a > 5) = true → true
         let expr = not(not(binary(col("a", &s)?, Operator::Gt, lit(5i32), &s)?)?)?;
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_not_true(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_not_true(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -646,9 +648,9 @@ mod tests {
         //   a > 5 = NULL → NOT(NULL) = NULL → CAST(NULL) = NULL → not-true
         let inner = not(binary(col("a", &s)?, Operator::Gt, lit(5i32), &s)?)?;
         let expr = Arc::new(CastExpr::new(inner, DataType::Int64, None));
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -667,10 +669,10 @@ mod tests {
         // Both null → IS NOT NULL(NULL)=FALSE → is_not_true=true (via is_null crossover)
         //             b > 5 with b null → is_not_true=true
         //   OR: both not-true → true
-        assert_eq!(expr.is_not_true(&null_cols(&[0, 1])), Some(true));
+        assert_eq!(expr.is_not_true(&null_cols(&[0, 1])), IsFalsy::Always);
         // Only a null → IS NOT NULL(NULL)=FALSE → not-true,
         //   but b > 5 with b not null → not not-true → OR = false
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(false));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -687,9 +689,9 @@ mod tests {
             &s,
         )?)?;
         // One null child → AND.is_null = None → NOT.is_not_true = None
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), None);
-        // Both null → AND.is_null = Some(true) → NOT.is_not_true = Some(true)
-        assert_eq!(expr.is_not_true(&null_cols(&[0, 1])), Some(true));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Sometimes);
+        // Both null → AND.is_null = IsFalsy::Always → NOT.is_not_true = IsFalsy::Always
+        assert_eq!(expr.is_not_true(&null_cols(&[0, 1])), IsFalsy::Always);
         Ok(())
     }
 
@@ -699,9 +701,9 @@ mod tests {
         // c LIKE c: both expr and pattern reference same column
         // when c (index 2) is null → NULL LIKE NULL = NULL
         let expr = Arc::new(LikeExpr::new(false, false, col("c", &s)?, col("c", &s)?));
-        assert_eq!(expr.is_null(&null_cols(&[2])), Some(true));
-        assert_eq!(expr.is_not_true(&null_cols(&[2])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[2])), IsFalsy::Always);
+        assert_eq!(expr.is_not_true(&null_cols(&[2])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Never);
         Ok(())
     }
 
@@ -715,8 +717,8 @@ mod tests {
             lit(5i32),
             &s,
         )?;
-        assert_eq!(expr.is_null(&null_cols(&[0, 1, 2])), Some(true));
-        assert_eq!(expr.is_not_true(&null_cols(&[0, 1, 2])), Some(true));
+        assert_eq!(expr.is_null(&null_cols(&[0, 1, 2])), IsFalsy::Always);
+        assert_eq!(expr.is_not_true(&null_cols(&[0, 1, 2])), IsFalsy::Always);
         Ok(())
     }
 
@@ -730,9 +732,9 @@ mod tests {
             &true,
             &s,
         )?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -757,7 +759,7 @@ mod tests {
             binary(col("a", &s)?, Operator::Gt, lit(3i32), &s)?,
             &s,
         )?;
-        assert_eq!(expr.is_not_true(&null_cols(&[0])), Some(true));
+        assert_eq!(expr.is_not_true(&null_cols(&[0])), IsFalsy::Always);
         Ok(())
     }
 
@@ -769,8 +771,8 @@ mod tests {
         // NOT(a > 5): is_null delegates to inner
         // a is null → a > 5 is NULL → NOT(NULL) = NULL
         let expr = not(binary(col("a", &s)?, Operator::Gt, lit(5i32), &s)?)?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -780,8 +782,8 @@ mod tests {
         // NOT(IS NULL(a)): IS NULL never returns NULL → NOT never gets NULL input
         // NOT(TRUE) = FALSE, NOT(FALSE) = TRUE — neither is NULL
         let expr = not(is_null(col("a", &s)?)?)?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(false));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -799,13 +801,13 @@ mod tests {
         //   b > 10 could be TRUE → NULL OR TRUE = TRUE
         //   b > 10 could be FALSE → NULL OR FALSE = NULL
         //   Can't determine → None
-        assert_eq!(expr.is_null(&null_cols(&[0])), None);
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Sometimes);
 
         // Both null: NULL OR NULL = NULL
-        assert_eq!(expr.is_null(&null_cols(&[0, 1])), Some(true));
+        assert_eq!(expr.is_null(&null_cols(&[0, 1])), IsFalsy::Always);
 
         // Neither null: not null
-        assert_eq!(expr.is_null(&null_cols(&[2])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[2])), IsFalsy::Never);
         Ok(())
     }
 
@@ -821,7 +823,7 @@ mod tests {
             lit(true),
             &s,
         )?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), None);
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Sometimes);
         Ok(())
     }
 
@@ -835,7 +837,7 @@ mod tests {
             binary(col("b", &s)?, Operator::Gt, lit(5i32), &s)?,
             &s,
         )?;
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(true));
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Always);
         Ok(())
     }
 
@@ -849,9 +851,9 @@ mod tests {
             col("b", &s)?,
             &s,
         )?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(false));
-        assert_eq!(expr.is_null(&null_cols(&[0, 1])), Some(false));
-        assert_eq!(expr.is_null(&null_cols(&[])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(expr.is_null(&null_cols(&[0, 1])), IsFalsy::Never);
+        assert_eq!(expr.is_null(&null_cols(&[])), IsFalsy::Never);
         Ok(())
     }
 
@@ -861,8 +863,8 @@ mod tests {
         // NOT(NOT(a > 5)): is_null propagates through both NOTs
         // a null → a > 5 = NULL → NOT(NULL) = NULL → NOT(NULL) = NULL
         let expr = not(not(binary(col("a", &s)?, Operator::Gt, lit(5i32), &s)?)?)?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -877,9 +879,9 @@ mod tests {
             binary(col("b", &s)?, Operator::Gt, lit(10i32), &s)?,
             &s,
         )?)?;
-        assert_eq!(expr.is_null(&null_cols(&[0, 1])), Some(true));
+        assert_eq!(expr.is_null(&null_cols(&[0, 1])), IsFalsy::Always);
         // When only a null → AND.is_null = None → NOT.is_null = None
-        assert_eq!(expr.is_null(&null_cols(&[0])), None);
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Sometimes);
         Ok(())
     }
 
@@ -888,8 +890,8 @@ mod tests {
         let s = schema();
         // IS NOT NULL(a > 5): IS NOT NULL never returns NULL regardless of input
         let expr = is_not_null(binary(col("a", &s)?, Operator::Gt, lit(5i32), &s)?)?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(false));
-        assert_eq!(expr.is_null(&null_cols(&[])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(expr.is_null(&null_cols(&[])), IsFalsy::Never);
         Ok(())
     }
 
@@ -898,8 +900,8 @@ mod tests {
         let s = schema();
         // IS NULL(a > 5): IS NULL never returns NULL regardless of input
         let expr = is_null(binary(col("a", &s)?, Operator::Gt, lit(5i32), &s)?)?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(false));
-        assert_eq!(expr.is_null(&null_cols(&[])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Never);
+        assert_eq!(expr.is_null(&null_cols(&[])), IsFalsy::Never);
         Ok(())
     }
 
@@ -908,8 +910,8 @@ mod tests {
         let s = schema();
         // a NOT IN (1, 2): when a is null → NULL
         let expr = in_list(col("a", &s)?, vec![lit(1i32), lit(2i32)], &true, &s)?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -920,10 +922,10 @@ mod tests {
         //           when c (index 2) is null → NULL
         //           when neither → not null
         let expr = Arc::new(LikeExpr::new(false, false, col("a", &s)?, col("c", &s)?));
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[2])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[0, 2])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[2])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[0, 2])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Never);
         Ok(())
     }
 
@@ -937,10 +939,10 @@ mod tests {
             col("a", &s)?,
             &s,
         )?;
-        assert_eq!(expr.is_null(&null_cols(&[0])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[1])), Some(true));
-        assert_eq!(expr.is_null(&null_cols(&[2])), Some(false));
-        assert_eq!(expr.is_null(&null_cols(&[])), Some(false));
+        assert_eq!(expr.is_null(&null_cols(&[0])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[1])), IsFalsy::Always);
+        assert_eq!(expr.is_null(&null_cols(&[2])), IsFalsy::Never);
+        assert_eq!(expr.is_null(&null_cols(&[])), IsFalsy::Never);
         Ok(())
     }
 }

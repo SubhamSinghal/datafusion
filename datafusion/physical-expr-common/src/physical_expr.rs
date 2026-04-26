@@ -72,6 +72,16 @@ pub type PhysicalExprRef = Arc<dyn PhysicalExpr>;
 /// [`Expr`]: https://docs.rs/datafusion/latest/datafusion/logical_expr/enum.Expr.html
 /// [`create_physical_expr`]: https://docs.rs/datafusion/latest/datafusion/physical_expr/fn.create_physical_expr.html
 /// [`Column`]: https://docs.rs/datafusion/latest/datafusion/physical_expr/expressions/struct.Column.html
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsFalsy {
+    /// The property always holds for any input.
+    Always,
+    /// May or may not hold depending on input values (unknown).
+    Sometimes,
+    /// The property never holds for any input.
+    Never,
+}
+
 pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
     /// Get the data type of this expression, given the schema of the input
     fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
@@ -446,24 +456,25 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
     /// `null_columns` contains the column indices (in the input schema) that
     /// are assumed to be `NULL`.
     ///
-    /// - `Some(true)`:  definitely evaluates to `NULL`
-    /// - `Some(false)`: definitely does NOT evaluate to `NULL`
-    /// - `None`:        unknown (conservative default)
-    fn is_null(&self, _null_columns: &HashSet<usize>) -> Option<bool> {
-        None
+    /// - [`IsFalsy::Always`]: definitely evaluates to `NULL`
+    /// - [`IsFalsy::Never`]: definitely does NOT evaluate to `NULL`
+    /// - [`IsFalsy::Sometimes`][]: unknown (conservative default)
+    fn is_null(&self, _null_columns: &HashSet<usize>) -> IsFalsy {
+        IsFalsy::Sometimes
     }
 
     /// Returns whether this expression is guaranteed to be not-true
-    /// (i.e., evaluates to `NULL` or `FALSE`).
+    /// (i.e., evaluates to `NULL` or `FALSE`) when all columns in
+    /// `null_columns` are `NULL`.
     ///
     /// `null_columns` contains the column indices (in the input schema) that
     /// are assumed to be `NULL`.
     ///
-    /// - `Some(true)`:  definitely evaluates to `NULL` or `FALSE`
-    /// - `Some(false)`: definitely does NOT evaluate to `NULL` or `FALSE`
-    /// - `None`:        unknown (conservative default)
-    fn is_not_true(&self, _null_columns: &HashSet<usize>) -> Option<bool> {
-        None
+    /// - [`IsFalsy::Always`]: some rows may evaluate `NULL` or `FALSE`
+    /// - [`IsFalsy::Never`]: definitely does NOT evaluate to `NULL` or `FALSE`
+    /// - [`IsFalsy::Sometimes`][]: unknown (conservative default)
+    fn is_not_true(&self, _null_columns: &HashSet<usize>) -> IsFalsy {
+        IsFalsy::Sometimes
     }
 }
 

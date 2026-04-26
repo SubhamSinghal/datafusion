@@ -17,6 +17,7 @@
 
 //! IS NOT NULL expression
 
+use crate::IsFalsy;
 use crate::PhysicalExpr;
 use arrow::{
     datatypes::{DataType, Schema},
@@ -104,15 +105,12 @@ impl PhysicalExpr for IsNotNullExpr {
         write!(f, " IS NOT NULL")
     }
 
-    fn is_null(&self, _null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+    fn is_null(&self, _null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
         // IS NOT NULL never returns NULL — always TRUE or FALSE
-        Some(false)
+        IsFalsy::Never
     }
 
-    fn is_not_true(
-        &self,
-        null_columns: &std::collections::HashSet<usize>,
-    ) -> Option<bool> {
+    fn is_not_true(&self, null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
         // IS NOT NULL(NULL) = FALSE — rejected
         // IS NOT NULL(non-null) = TRUE — passes
         // Must use is_null — IS NOT NULL flips FALSE to TRUE

@@ -21,6 +21,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::sync::Arc;
 
+use crate::IsFalsy;
 use crate::PhysicalExpr;
 
 use arrow::datatypes::{DataType, FieldRef, Schema};
@@ -179,15 +180,12 @@ impl PhysicalExpr for NotExpr {
         self.arg.fmt_sql(f)
     }
 
-    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> Option<bool> {
+    fn is_null(&self, null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
         // NOT(NULL) = NULL
         self.arg.is_null(null_columns)
     }
 
-    fn is_not_true(
-        &self,
-        null_columns: &std::collections::HashSet<usize>,
-    ) -> Option<bool> {
+    fn is_not_true(&self, null_columns: &std::collections::HashSet<usize>) -> IsFalsy {
         // NOT(NULL) = NULL (not-true) ✓
         // NOT(FALSE) = TRUE (passes!) ✗
         // Must use is_null — NOT flips FALSE to TRUE
