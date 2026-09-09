@@ -89,8 +89,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::task::{Poll, ready};
 
-use arrow::array::{Array, ArrayRef, RecordBatch};
+use arrow::array::{Array, ArrayRef, RecordBatch, Scalar};
 use arrow::compute::BatchCoalescer;
+use arrow::compute::kernels::cmp::{gt, gt_eq, lt, lt_eq};
 use arrow_schema::{SchemaRef, SortOptions};
 use datafusion_common::{NullEquality, Result, internal_err};
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
@@ -241,8 +242,12 @@ impl ExistencePWMJStream {
                 self.join_metrics.input_batches.add(1);
                 self.join_metrics.input_rows.add(batch.num_rows());
 
-                // An empty batch has no extreme key to compare, so it can neither match
-                // nor miss -- counting it either way would understate the real hit rate.
+                // `probe_hit_rate` is defined per streamed row, so it has to be
+                // recorded before the batch is reduced to its extreme key below.
+                self.record_probe_hits(&stream_values)?;
+
+                // An empty batch has no extreme key to reduce to, and nothing it could
+                // mark.
                 if batch.num_rows() > 0 {
                     // Only the batch's extreme key is ever compared against the buffered
                     // side, so reduce the batch to that one key.
@@ -293,12 +298,67 @@ impl ExistencePWMJStream {
         Ok(())
     }
 
+    /// Records `probe_hit_rate` for one streamed batch: `part` is the number of rows in it
+    /// that match at least one buffered row, `total` the number of rows scanned.
+    ///
+    /// Counted per row rather than per batch so the metric means the same thing here as it
+    /// does in `ClassicPWMJStream` and `HashJoinExec` -- "fraction of probe rows with a
+    /// build-side match", as documented on `BuildProbeJoinMetrics::probe_hit_rate`. That
+    /// also keeps `probe_hit_rate`'s denominator equal to `input_rows`.
+    ///
+    /// The extreme-key reduction the rest of this stream relies on cannot answer this: it
+    /// collapses the batch to the one key that reaches the smallest `buffer_idx`, which
+    /// says whether the *batch* matched, not how many of its rows did. But no scan is
+    /// needed either. `is_match` is monotone over the sorted buffered side, so the single
+    /// most-matching buffered key is its last non-null row, and a streamed row matches
+    /// something exactly when it beats that key -- one vectorized comparison per batch,
+    /// leaving the `O(log buffered)` watermark search untouched.
+    ///
+    /// One float-only caveat: these kernels compare by IEEE rules, where NaN is false
+    /// against everything, while the watermark search compares by `make_comparator`'s total
+    /// ordering, where NaN is greater than everything. A buffered NaN sitting at the
+    /// extreme end therefore marks rows this ratio scores as misses. Only the metric
+    /// diverges; the join result still comes from the watermark.
+    fn record_probe_hits(&self, stream_values: &ArrayRef) -> Result<()> {
+        self.join_metrics
+            .probe_hit_rate
+            .add_total(stream_values.len());
+
+        let buffered_values = self.buffered_side.try_as_ready()?.buffered_data.values();
+        let buffered_len = buffered_values.len();
+
+        // Buffered NULLs sort to the front, so an all-null (or empty) buffered side has no
+        // key any streamed row could match.
+        if buffered_len == buffered_values.null_count() {
+            return Ok(());
+        }
+        let extreme_buffered = Scalar::new(buffered_values.slice(buffered_len - 1, 1));
+
+        // The join predicate is `buffered <op> streamed`, so it flips when the streamed
+        // rows become the left-hand side. NULL streamed keys compare to NULL and are
+        // excluded by `true_count`, which is what a NULL key deserves: it never matches.
+        let hits = match self.operator {
+            Operator::Gt => lt(stream_values, &extreme_buffered)?,
+            Operator::GtEq => lt_eq(stream_values, &extreme_buffered)?,
+            Operator::Lt => gt(stream_values, &extreme_buffered)?,
+            Operator::LtEq => gt_eq(stream_values, &extreme_buffered)?,
+            operator => {
+                return internal_err!(
+                    "PiecewiseMergeJoin should not contain operator, {}",
+                    operator
+                );
+            }
+        };
+        self.join_metrics.probe_hit_rate.add_part(hits.true_count());
+
+        Ok(())
+    }
+
     /// Marks every buffered row matched by `stream_values`, a one-row array holding the
     /// batch's extreme compare key (null only if the whole batch was null).
     fn mark_matched_buffered_rows(&mut self, stream_values: &ArrayRef) -> Result<()> {
         let operator = self.operator;
         let sort_option = self.sort_option;
-        self.join_metrics.probe_hit_rate.add_total(1);
 
         {
             let buffered_data = &self.buffered_side.try_as_ready()?.buffered_data;
@@ -337,7 +397,7 @@ impl ExistencePWMJStream {
                 }
             };
 
-            if row_idx < stream_values.len() && first_non_null_buffered < buffered_len {
+            if row_idx < stream_values.len() && first_non_null_buffered < scan_limit {
                 let cmp = JoinKeyComparator::new(
                     &[Arc::clone(stream_values)],
                     &[Arc::clone(buffered_values)],
@@ -350,53 +410,41 @@ impl ExistencePWMJStream {
                         || (match_on_equal && compare == Ordering::Equal)
                 };
 
-                // Whether this batch matches *anything* is independent of the watermark:
-                // another partition's batch may have already marked this batch's true
-                // match point, leaving nothing left for the bounded search below to find.
-                // `is_match` is monotone over the whole buffered side, so checking the
-                // last row alone (rather than re-deriving `buffer_idx` unbounded) is
-                // enough to tell whether a match exists anywhere.
-                if is_match(buffered_len - 1) {
-                    self.join_metrics.probe_hit_rate.add_part(1);
+                // Because the buffered side is sorted, `is_match` is monotone over it:
+                // false while the buffered key has not yet passed the streamed key, true
+                // from there on. So the first match is a partition point and can be found
+                // by binary search instead of a walk -- `O(log buffered)` per batch rather
+                // than `O(buffered)`.
+                let mut lo = first_non_null_buffered;
+                let mut hi = scan_limit;
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    if is_match(mid) {
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
                 }
 
-                if first_non_null_buffered < scan_limit {
-                    // Because the buffered side is sorted, `is_match` is monotone over
-                    // it: false while the buffered key has not yet passed the streamed
-                    // key, true from there on. So the first match is a partition point
-                    // and can be found by binary search instead of a walk --
-                    // `O(log buffered)` per batch rather than `O(buffered)`.
-                    let mut lo = first_non_null_buffered;
-                    let mut hi = scan_limit;
-                    while lo < hi {
-                        let mid = lo + (hi - lo) / 2;
-                        if is_match(mid) {
-                            hi = mid;
-                        } else {
-                            lo = mid + 1;
-                        }
-                    }
-
-                    // `lo` is now the first matching buffered index, or `scan_limit` if
-                    // this batch matches nothing new.
-                    let buffer_idx = lo;
-                    if buffer_idx < scan_limit {
-                        // Everything from `buffer_idx` on matches, so lowering the
-                        // watermark to it records the match: the marked set is exactly
-                        // `[min_marked, buffered_len)` and needs no bitmap.
-                        //
-                        // INVARIANT: sound only because the buffered side and each
-                        // streamed batch are sorted the same way for this operator
-                        // (`try_new` derives `sort_option`: descending for `<`/`<=`,
-                        // ascending for `>`/`>=`). That makes this the smallest
-                        // reachable `buffer_idx`, so the marked suffix is maximal. Only
-                        // the ordering *within* a batch matters; batches themselves may
-                        // arrive in any order, which is why the watermark takes a `min`
-                        // rather than just decreasing.
-                        buffered_data
-                            .min_marked
-                            .fetch_min(buffer_idx, AtomicOrdering::SeqCst);
-                    }
+                // `lo` is now the first matching buffered index, or `scan_limit` if this
+                // batch matches nothing new.
+                let buffer_idx = lo;
+                if buffer_idx < scan_limit {
+                    // Everything from `buffer_idx` on matches, so lowering the
+                    // watermark to it records the match: the marked set is exactly
+                    // `[min_marked, buffered_len)` and needs no bitmap.
+                    //
+                    // INVARIANT: sound only because the buffered side and each
+                    // streamed batch are sorted the same way for this operator
+                    // (`try_new` derives `sort_option`: descending for `<`/`<=`,
+                    // ascending for `>`/`>=`). That makes this the smallest reachable
+                    // `buffer_idx`, so the marked suffix is maximal. Only the ordering
+                    // *within* a batch matters; batches themselves may arrive in any
+                    // order, which is why the watermark takes a `min` rather than just
+                    // decreasing.
+                    buffered_data
+                        .min_marked
+                        .fetch_min(buffer_idx, AtomicOrdering::SeqCst);
                 }
             }
         }
@@ -840,12 +888,13 @@ mod tests {
         Ok(())
     }
 
-    /// Existence join never populated `probe_hit_rate`, so a streamed batch whose extreme
-    /// key failed to lower the watermark was indistinguishable from one that did. Two
-    /// batches here: the first lowers the watermark, the second matches nothing in the
-    /// buffered side and must count as a miss.
+    /// `probe_hit_rate` is a fraction of streamed *rows*, matching its definition on
+    /// `BuildProbeJoinMetrics` and what `ClassicPWMJStream`/`HashJoinExec` report. The
+    /// extreme-key reduction only says whether a *batch* matched, so a batch with a mix of
+    /// matching and non-matching rows is what separates the two: counting per batch would
+    /// report 2/2 (100%) here rather than 2/5 (40%).
     #[tokio::test]
-    async fn probe_hit_rate_counts_batches_that_advance_the_watermark() -> Result<()> {
+    async fn probe_hit_rate_counts_matching_rows_not_batches() -> Result<()> {
         let left = build_table(
             ("a1", &vec![1, 2, 3, 4, 5]),
             ("b1", &vec![1, 2, 3, 4, 5]),
@@ -857,12 +906,17 @@ mod tests {
             Field::new("b1", DataType::Int32, false),
             Field::new("c2", DataType::Int32, false),
         ]);
-        // b1=3 lowers the watermark to buffered index 3 (value 4).
-        let batch1 =
-            build_table_i32(("a2", &vec![10]), ("b1", &vec![3]), ("c2", &vec![70]));
-        // b1=10 matches no buffered value (max buffered value is 5) -- a genuine miss.
+        // b1=3 and b1=4 are exceeded by buffered value 5, so they match; b1=9 and b1=10
+        // exceed every buffered value, so they miss. The batch's extreme key (3) also
+        // lowers the watermark to buffered index 3 (value 4).
+        let batch1 = build_table_i32(
+            ("a2", &vec![10, 20, 30, 40]),
+            ("b1", &vec![3, 4, 9, 10]),
+            ("c2", &vec![70, 80, 90, 100]),
+        );
+        // A batch that matches nothing at all -- one more miss, and no batch-level hit.
         let batch2 =
-            build_table_i32(("a2", &vec![20]), ("b1", &vec![10]), ("c2", &vec![80]));
+            build_table_i32(("a2", &vec![50]), ("b1", &vec![11]), ("c2", &vec![110]));
         let right = TestMemoryExec::try_new_exec(
             &[vec![batch1, batch2]],
             Arc::new(streamed_schema),
@@ -907,7 +961,11 @@ mod tests {
                 _ => None,
             })
             .expect("probe_hit_rate metric");
-        assert_eq!(hit_rate, (1, 2), "one hit, one miss");
+        assert_eq!(
+            hit_rate,
+            (2, 5),
+            "2 of 5 streamed rows match a buffered row"
+        );
 
         Ok(())
     }
@@ -954,8 +1012,8 @@ mod tests {
             .expect("probe_hit_rate metric"))
     }
 
-    /// A batch's hit/miss must reflect whether it matches the buffered side at all, not
-    /// whether it was the one to lower the shared watermark. Both streamed batches here
+    /// A row's hit/miss must reflect whether it matches the buffered side at all, not
+    /// whether its batch was the one to lower the shared watermark. Both streamed rows here
     /// (b1=3, b1=4) genuinely match buffered value 5 under `Gt`, so both are hits
     /// regardless of which one lowers the watermark first -- the result must not change
     /// when the batches are scanned in the opposite order.
@@ -989,7 +1047,7 @@ mod tests {
             existence_probe_hit_rate(make_left(), streamed_schema, vec![batch2, batch1])
                 .await?;
 
-        assert_eq!(forward, (2, 2), "both batches match buffered value 5");
+        assert_eq!(forward, (2, 2), "both rows match buffered value 5");
         assert_eq!(forward, reversed, "hit rate must not depend on batch order");
 
         Ok(())
@@ -1082,7 +1140,7 @@ mod tests {
         // Partition 0 = key_4 (lowers the watermark first instead).
         let p1_first = hit_rate_for(make_left(), streamed_schema, key_4, key_3).await?;
 
-        assert_eq!(p0_first, (2, 2), "both partitions' batches genuinely match");
+        assert_eq!(p0_first, (2, 2), "both partitions' rows genuinely match");
         assert_eq!(
             p0_first, p1_first,
             "hit rate must not depend on which partition races ahead"
@@ -1091,10 +1149,8 @@ mod tests {
         Ok(())
     }
 
-    /// An empty streamed batch has no extreme key to compare against the buffered side,
-    /// so it must count as neither a hit nor a miss. Before the guard in `scan_stream_batch`,
-    /// `mark_matched_buffered_rows` ran unconditionally and inflated `probe_hit_rate`'s
-    /// denominator with misses for batches that never actually scanned anything.
+    /// An empty streamed batch holds no rows to match, so it must move neither side of
+    /// `probe_hit_rate` -- the ratio stays a fraction of the rows actually scanned.
     #[tokio::test]
     async fn probe_hit_rate_ignores_empty_streamed_batches() -> Result<()> {
         let left = build_table(
@@ -1160,7 +1216,7 @@ mod tests {
                 _ => None,
             })
             .expect("probe_hit_rate metric");
-        // Only the real batch counts -- the empty batch contributes to neither part nor total.
+        // Only the real batch's single row counts; the empty batch contributes nothing.
         assert_eq!(hit_rate, (1, 1));
 
         Ok(())
